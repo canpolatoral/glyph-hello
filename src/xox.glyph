@@ -1,0 +1,420 @@
+module xox
+
+import std/array
+import std/option { Option, Some, None }
+import std/string
+
+// A single square of the board.
+pub type Cell =
+  | Empty
+  | X
+  | O
+
+// Nine squares, row-major: 0,1,2 is the top row.
+pub type Board = Array<Cell>
+
+// The state of a finished or unfinished game.
+pub type Outcome =
+  | Ongoing
+  | Draw
+  | Win({ winner: Cell, line: Array<number> })
+
+// How hard the engine tries. Perfect searches every reply and cannot be
+// beaten; Fair sees one move ahead but misses forks; Careless only ever
+// takes a win that is already on the board.
+pub type Level =
+  | Perfect
+  | Fair
+  | Careless
+
+// What the engine thinks a square is worth, for the X-ray view.
+pub type Eval = { square: number, score: number }
+
+// The eight ways to make three in a row.
+pub const win_lines: Array<Array<number>> = [
+  [0, 1, 2],
+  [3, 4, 5],
+  [6, 7, 8],
+  [0, 3, 6],
+  [1, 4, 7],
+  [2, 5, 8],
+  [0, 4, 8],
+  [2, 4, 6],
+]
+
+pub fn empty_board() -> Board {
+  return array.map(array.range(9), fn(_i: number) -> Cell { Empty })
+}
+
+pub fn mark(c: Cell) -> string {
+  return match c {
+    Empty => ".",
+    X => "X",
+    O => "O",
+  }
+}
+
+pub fn same(a: Cell, b: Cell) -> bool {
+  return mark(a) == mark(b)
+}
+
+pub fn is_empty(c: Cell) -> bool {
+  return same(c, Empty)
+}
+
+pub fn other(c: Cell) -> Cell {
+  return match c {
+    X => O,
+    O => X,
+    Empty => Empty,
+  }
+}
+
+// Reads a board from nine characters, e.g. "XX.OO....". Anything that is not
+// `X` or `O` counts as an empty square.
+pub fn from_text(text: string) -> Board {
+  let chars = string.split(text, "")
+  return array.map(
+    array.range(9),
+    fn(i: number) -> Cell {
+      let ch = match i < array.len(chars) {
+        true => chars[i],
+        false => ".",
+      }
+      let cell = match ch {
+        "X" => X,
+        "O" => O,
+        else => Empty,
+      }
+      return cell
+    },
+  )
+}
+
+// The nine-character form of a board, the shape `from_text` reads back.
+@example to_text(from_text("XX.O.....")) == "XX.O....."
+pub fn to_text(b: Board) -> string {
+  let marks = array.map(b, fn(c: Cell) -> string { mark(c) })
+  return string.join(marks, "")
+}
+
+pub fn cell_from(text: string) -> Cell {
+  return match text {
+    "X" => X,
+    "O" => O,
+    else => Empty,
+  }
+}
+
+pub fn level_from(text: string) -> Level {
+  return match text {
+    "fair" => Fair,
+    "careless" => Careless,
+    else => Perfect,
+  }
+}
+
+// A copy of the board with `idx` set to `c`; the original is untouched.
+pub fn place(b: Board, idx: number, c: Cell) -> Board {
+  return array.map(
+    array.range(9),
+    fn(i: number) -> Cell {
+      let cell = match i == idx {
+        true => c,
+        false => b[i],
+      }
+      return cell
+    },
+  )
+}
+
+pub fn is_free(b: Board, idx: number) -> bool {
+  let inside = idx >= 0 && idx < 9
+  return match inside {
+    true => is_empty(b[idx]),
+    false => false,
+  }
+}
+
+// Indices of every square still open, in ascending order.
+pub fn available(b: Board) -> Array<number> {
+  return array.filter(array.range(9), fn(i: number) -> bool { is_free(b, i) })
+}
+
+// The mark owning this line, or Empty if the line is not complete.
+fn line_winner(b: Board, line: Array<number>) -> Cell {
+  let a = b[line[0]]
+  let c = b[line[1]]
+  let d = b[line[2]]
+  let won = !is_empty(a) && same(a, c) && same(a, d)
+  return match won {
+    true => a,
+    false => Empty,
+  }
+}
+
+pub fn outcome(b: Board) -> Outcome {
+  let wins = array.filter(
+    win_lines,
+    fn(line: Array<number>) -> bool { return !is_empty(line_winner(b, line)) },
+  )
+  let unfinished = match array.len(available(b)) == 0 {
+    true => Draw,
+    false => Ongoing,
+  }
+  let result = match array.len(wins) > 0 {
+    true => Win({ winner: line_winner(b, wins[0]), line: wins[0] }),
+    false => unfinished,
+  }
+  return result
+}
+
+@example outcome_label(from_text("XXXOO....")) == "X wins"
+@example outcome_label(from_text("OXXOX.O..")) == "O wins"
+@example outcome_label(from_text("XOXXOOOXX")) == "draw"
+@example outcome_label(from_text(".........")) == "ongoing"
+pub fn outcome_label(b: Board) -> string {
+  return match outcome(b) {
+    Win(w) => "${mark(w.winner)} wins",
+    Draw => "draw",
+    Ongoing => "ongoing",
+  }
+}
+
+// Score of a finished-or-not board from `me`'s point of view. A win is worth
+// more the sooner it lands, so the engine finishes games instead of stalling.
+fn score(b: Board, me: Cell, turn: Cell, depth: number) -> number {
+  let settled = match outcome(b) {
+    Win(w) => Some(w.winner),
+    Draw => Some(Empty),
+    Ongoing => None,
+  }
+  return match settled {
+    Some(winner) => terminal_score(winner, me, depth),
+    None => lookahead(b, me, turn, depth),
+  }
+}
+
+fn terminal_score(winner: Cell, me: Cell, depth: number) -> number {
+  let mine = same(winner, me)
+  let theirs = same(winner, other(me))
+  let value = match mine {
+    true => 10 - depth,
+    false => match theirs {
+      true => depth - 10,
+      false => 0,
+    },
+  }
+  return value
+}
+
+// Minimax: `me` maximises, the opponent minimises. Nine squares is small
+// enough to search exhaustively, so the engine never loses.
+fn lookahead(b: Board, me: Cell, turn: Cell, depth: number) -> number {
+  let scores = array.map(
+    available(b),
+    fn(i: number) -> number { return score(place(b, i, turn), me, other(turn), depth + 1) },
+  )
+  let best = match same(turn, me) {
+    true => array.fold(
+      scores,
+      -100,
+      fn(acc: number, s: number) -> number {
+        let picked = match s > acc {
+          true => s,
+          false => acc,
+        }
+        return picked
+      },
+    ),
+    false => array.fold(
+      scores,
+      100,
+      fn(acc: number, s: number) -> number {
+        let picked = match s < acc {
+          true => s,
+          false => acc,
+        }
+        return picked
+      },
+    ),
+  }
+  return best
+}
+
+type Choice = { idx: number, value: number }
+
+// The strongest move for `me`, or None on a full board.
+@example best_move(from_text("XX......."), O) == Some(2)
+@example best_move(from_text("OO.XX...."), O) == Some(2)
+@example best_move(from_text("XOXXOOOXX"), X) == None
+pub fn best_move(b: Board, me: Cell) -> Option<number> {
+  let moves = available(b)
+  let start: Choice = { idx: -1, value: -1000 }
+  let best = array.fold(
+    moves,
+    start,
+    fn(acc: Choice, i: number) -> Choice {
+      let value = score(place(b, i, me), me, other(me), 1)
+      let candidate: Choice = { idx: i, value: value }
+      let picked = match value > acc.value {
+        true => candidate,
+        false => acc,
+      }
+      return picked
+    },
+  )
+  return match best.idx >= 0 {
+    true => Some(best.idx),
+    false => None,
+  }
+}
+
+// What every open square is worth to `me`, straight from the search. This is
+// what the browser's X-ray view draws into the board.
+pub fn evaluate(b: Board, me: Cell) -> Array<Eval> {
+  return array.map(
+    available(b),
+    fn(i: number) -> Eval {
+      let e: Eval = { square: i, score: score(place(b, i, me), me, other(me), 1) }
+      return e
+    },
+  )
+}
+
+// A number derived from the position, used to break ties between equally
+// good moves. Play stays deterministic for a given board — no RNG — but the
+// engine stops opening the same way every single game.
+fn board_hash(b: Board) -> number {
+  return array.fold(
+    array.range(9),
+    7,
+    fn(acc: number, i: number) -> number { return (acc * 31 + cell_code(b[i]) * (i + 3)) % 100003 },
+  )
+}
+
+fn cell_code(c: Cell) -> number {
+  return match c {
+    Empty => 1,
+    X => 2,
+    O => 3,
+  }
+}
+
+fn pick_by_hash(b: Board, moves: Array<number>) -> number {
+  return moves[board_hash(b) % array.len(moves)]
+}
+
+// True when dropping `me` on square `i` wins on the spot.
+fn wins_now(b: Board, me: Cell, i: number) -> bool {
+  return match outcome(place(b, i, me)) {
+    Win(w) => same(w.winner, me),
+    Draw => false,
+    Ongoing => false,
+  }
+}
+
+// The squares that tie for the best score.
+fn top_squares(evals: Array<Eval>) -> Array<number> {
+  let best = array.fold(
+    evals,
+    -1000,
+    fn(acc: number, e: Eval) -> number {
+      let v = match e.score > acc {
+        true => e.score,
+        false => acc,
+      }
+      return v
+    },
+  )
+  let tied = array.filter(evals, fn(e: Eval) -> bool { return e.score == best })
+  return array.map(tied, fn(e: Eval) -> number { return e.square })
+}
+
+// One move of lookahead: win if you can, block if `blocking`, else anything.
+fn tactical(b: Board, me: Cell, moves: Array<number>, blocking: bool) -> number {
+  let wins = array.filter(moves, fn(i: number) -> bool { return wins_now(b, me, i) })
+  let blocks = array.filter(moves, fn(i: number) -> bool { return wins_now(b, other(me), i) })
+  let quiet = match blocking && array.len(blocks) > 0 {
+    true => blocks[0],
+    false => pick_by_hash(b, moves),
+  }
+  let chosen = match array.len(wins) > 0 {
+    true => wins[0],
+    false => quiet,
+  }
+  return chosen
+}
+
+// Perfect blocks and forks; Fair blocks but walks into forks; Careless only
+// finishes a win already on the board.
+@example choose_move(from_text("XX......."), O, Fair) == Some(2)
+@example choose_move(from_text("OO.XX...."), O, Careless) == Some(2)
+@example choose_move(from_text("XOXXOOOXX"), X, Perfect) == None
+pub fn choose_move(b: Board, me: Cell, level: Level) -> Option<number> {
+  let evals = evaluate(b, me)
+  return match array.len(evals) == 0 {
+    true => None,
+    false => Some(decide(b, me, evals, level)),
+  }
+}
+
+// Never called with an empty `evals`, so the tie-breaks always have a square
+// to choose from.
+fn decide(b: Board, me: Cell, evals: Array<Eval>, level: Level) -> number {
+  let moves = array.map(evals, fn(e: Eval) -> number { return e.square })
+  let chosen = match level {
+    Perfect => pick_by_hash(b, top_squares(evals)),
+    Fair => tactical(b, me, moves, true),
+    Careless => tactical(b, me, moves, false),
+  }
+  return chosen
+}
+
+// Plays the rest of the game out with both sides choosing best_move, and
+// reports how it ends. Two perfect players always draw, so this is the
+// regression test for the engine.
+@example self_play(from_text("X........"), O) == "draw"
+@example self_play(from_text("XX.O....."), X) == "X wins"
+pub fn self_play(b: Board, turn: Cell) -> string {
+  let ended = match outcome(b) {
+    Win(_w) => Some(outcome_label(b)),
+    Draw => Some("draw"),
+    Ongoing => None,
+  }
+  return match ended {
+    Some(label) => label,
+    None => play_on(b, turn),
+  }
+}
+
+fn play_on(b: Board, turn: Cell) -> string {
+  return match choose_move(b, turn, Perfect) {
+    Some(idx) => self_play(place(b, idx, turn), other(turn)),
+    None => "draw",
+  }
+}
+
+// An open square shows its own number, so the player can see what to type.
+fn cell_text(b: Board, i: number) -> string {
+  let n = number.to_string(i + 1)
+  return match is_empty(b[i]) {
+    true => n,
+    false => mark(b[i]),
+  }
+}
+
+fn row_text(b: Board, row: number) -> string {
+  let cells = array.map(
+    array.range(3),
+    fn(col: number) -> string { return cell_text(b, row * 3 + col) },
+  )
+  let joined = string.join(cells, " | ")
+  return "  ${joined}"
+}
+
+@example render(from_text("X...O....")) == "  X | 2 | 3\n ---+---+---\n  4 | O | 6\n ---+---+---\n  7 | 8 | 9"
+pub fn render(b: Board) -> string {
+  let rows = array.map(array.range(3), fn(row: number) -> string { row_text(b, row) })
+  return string.join(rows, "\n ---+---+---\n")
+}

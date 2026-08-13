@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XOX</title>
+<link rel="stylesheet" href="/xox.css">
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+<main class="stage">
+  <header class="masthead">
+    <h1 class="wordmark"><span>X</span><span>O</span><span>X</span></h1>
+    <p class="tag">Nine squares, searched to the last ply</p>
+  </header>
+
+  <div class="play">
+    <svg id="board" class="board" viewBox="0 0 320 320" aria-label="Board"></svg>
+    <p class="caption" id="caption"></p>
+  </div>
+
+  <aside class="rail">
+    <div class="status" id="status">
+      <span class="status-word" id="statusWord">Your move</span>
+      <span class="status-note" id="statusNote">You are X</span>
+    </div>
+
+    <section class="field">
+      <h2 class="label">Opponent</h2>
+      <div class="seg" id="levelSeg">
+        <button data-level="perfect" class="on">Perfect</button>
+        <button data-level="fair">Fair</button>
+        <button data-level="careless">Careless</button>
+        <button data-level="human">2 players</button>
+      </div>
+    </section>
+
+    <section class="field" id="sideField">
+      <h2 class="label">You play</h2>
+      <div class="seg" id="sideSeg">
+        <button data-side="X" class="on">X <em>first</em></button>
+        <button data-side="O">O <em>second</em></button>
+      </div>
+    </section>
+
+    <section class="field">
+      <h2 class="label">Tally</h2>
+      <div class="tally">
+        <div><b id="tallyYou">0</b><span id="labelYou">you</span></div>
+        <div><b id="tallyCpu">0</b><span id="labelCpu">engine</span></div>
+        <div><b id="tallyDraw">0</b><span>draws</span></div>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="xray" class="ghost-btn" aria-pressed="false">X-ray <kbd>X</kbd></button>
+      <button id="reset" class="ghost-btn">New game <kbd>R</kbd></button>
+    </div>
+
+    <p class="credit">minimax engine in Glyph<br>served by std/http</p>
+  </aside>
+</main>
+<script src="/xox.js"></script>
+</body>
+</html>

@@ -1,0 +1,244 @@
+module cli
+
+import std/array
+import std/io
+import std/option { Option, Some, None }
+import std/string
+import xox { Board, Cell, X, O, Outcome, Ongoing, Draw, Win }
+import xox
+
+// Who is sitting behind each mark.
+type Mode =
+  | HotSeat
+  | HumanFirst
+  | ComputerFirst
+
+const intro: string = "
+  X O X   XOX (tic-tac-toe)
+  O X O   Three in a row wins.
+
+  Squares are numbered 1-9, left to right, top to bottom.
+  Type `q` at any prompt to quit.
+"
+
+const menu: string = "  1) Two players (hot seat)
+  2) You vs computer (you are X, you start)
+  3) You vs computer (computer is X, it starts)
+"
+
+pub fn run(argv: Array<string>) -> number {
+  io.println(intro)
+  let mode = pick_mode(argv)
+  return match mode {
+    Some(m) => run_sessions(m),
+    None => farewell(),
+  }
+}
+
+fn farewell() -> number {
+  io.println("Bye.")
+  return 0
+}
+
+fn run_sessions(mode: Mode) -> number {
+  loop {
+    play(mode)
+    let again = ask_yes_no("Play again? [y/N]: ")
+    match again {
+      true => io.println(""),
+      false => { break },
+    }
+  }
+  return farewell()
+}
+
+// One complete game. Returns when someone wins, the board fills, or the
+// player quits.
+fn play(mode: Mode) -> void {
+  let board = xox.empty_board()
+  let turn = X
+  loop {
+    io.println("")
+    io.println(xox.render(board))
+    io.println("")
+    let state = xox.outcome(board)
+    match is_over(state) {
+      true => {
+        io.println(finish_text(state))
+        break
+      },
+      false => void,
+    }
+    let choice = match is_computer(mode, turn) {
+      true => computer_move(board, turn),
+      false => human_move(board, turn),
+    }
+    match choice {
+      None => { break },
+      Some(idx) => {
+        mut board = xox.place(board, idx, turn)
+        mut turn = xox.other(turn)
+      },
+    }
+  }
+}
+
+fn is_over(state: Outcome) -> bool {
+  return match state {
+    Win(_w) => true,
+    Draw => true,
+    Ongoing => false,
+  }
+}
+
+fn finish_text(state: Outcome) -> string {
+  return match state {
+    Win(w) => win_text(w.winner, w.line),
+    Draw => "  It's a draw.",
+    Ongoing => "",
+  }
+}
+
+fn win_text(winner: Cell, line: Array<number>) -> string {
+  let squares = array.map(line, fn(i: number) -> string { number.to_string(i + 1) })
+  let joined = string.join(squares, "-")
+  let who = xox.mark(winner)
+  return "  ${who} wins on ${joined}!"
+}
+
+fn is_computer(mode: Mode, turn: Cell) -> bool {
+  return match mode {
+    HotSeat => false,
+    HumanFirst => xox.same(turn, O),
+    ComputerFirst => xox.same(turn, X),
+  }
+}
+
+fn computer_move(b: Board, p: Cell) -> Option<number> {
+  let choice = xox.best_move(b, p)
+  match choice {
+    Some(idx) => announce(p, idx),
+    None => void,
+  }
+  return choice
+}
+
+fn announce(p: Cell, idx: number) -> void {
+  let who = xox.mark(p)
+  let square = number.to_string(idx + 1)
+  io.println("  Computer (${who}) plays ${square}.")
+}
+
+// Prompts until the player names a free square, or gives up (None).
+fn human_move(b: Board, p: Cell) -> Option<number> {
+  loop {
+    let who = xox.mark(p)
+    io.print("  Player ${who} — square (1-9, q to quit): ")
+    let line = io.read_line()
+    match line {
+      None => {
+        io.println("")
+        return None
+      },
+      Some(text) => {
+        let answer = normalize(text)
+        match is_quit(answer) {
+          true => { return None },
+          false => void,
+        }
+        let idx = parse_square(answer)
+        match idx < 0 {
+          true => io.println("  Pick a number from 1 to 9."),
+          false => {
+            match xox.is_free(b, idx) {
+              true => { return Some(idx) },
+              false => io.println("  That square is already taken."),
+            }
+          },
+        }
+      },
+    }
+  }
+}
+
+fn normalize(text: string) -> string {
+  return string.lower(string.trim(text))
+}
+
+fn is_quit(answer: string) -> bool {
+  return answer == "q" || answer == "quit" || answer == "exit"
+}
+
+// The square index (0-8) for a typed square number, or -1 if it is not one.
+fn parse_square(answer: string) -> number {
+  return match answer {
+    "1" => 0,
+    "2" => 1,
+    "3" => 2,
+    "4" => 3,
+    "5" => 4,
+    "6" => 5,
+    "7" => 6,
+    "8" => 7,
+    "9" => 8,
+    else => -1,
+  }
+}
+
+// Mode comes from the first argument when it is 1, 2 or 3; otherwise ask.
+fn pick_mode(argv: Array<string>) -> Option<Mode> {
+  let from_args = match argv {
+    ["1"] => Some(HotSeat),
+    ["2"] => Some(HumanFirst),
+    ["3"] => Some(ComputerFirst),
+    else => None,
+  }
+  return match from_args {
+    Some(m) => Some(m),
+    None => ask_mode(),
+  }
+}
+
+fn ask_mode() -> Option<Mode> {
+  loop {
+    io.println(menu)
+    io.print("  Mode [1-3]: ")
+    let line = io.read_line()
+    match line {
+      None => {
+        io.println("")
+        return None
+      },
+      Some(text) => {
+        let answer = normalize(text)
+        match is_quit(answer) {
+          true => { return None },
+          false => void,
+        }
+        let picked = match answer {
+          "1" => Some(HotSeat),
+          "2" => Some(HumanFirst),
+          "3" => Some(ComputerFirst),
+          else => None,
+        }
+        match picked {
+          Some(m) => { return Some(m) },
+          None => io.println("  Type 1, 2 or 3."),
+        }
+      },
+    }
+  }
+}
+
+fn ask_yes_no(prompt: string) -> bool {
+  io.print(prompt)
+  let line = io.read_line()
+  return match line {
+    None => false,
+    Some(text) => yes(normalize(text)),
+  }
+}
+
+fn yes(answer: string) -> bool {
+  return answer == "y" || answer == "yes"
+}

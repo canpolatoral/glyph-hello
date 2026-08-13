@@ -1,0 +1,185 @@
+module web
+
+import std/fs
+import std/http
+import std/io
+import std/option { Some, None }
+import std/path
+import std/process
+import xox { Board, Eval, Ongoing, Draw, Win }
+import xox
+
+// What the browser posts: the position, the square just clicked (-1 to ask
+// the engine to open), whose mark that square is, and who the opponent is.
+type MoveRequest = { board: string, square: number, turn: string, level: string }
+
+// The authoritative reply. The server owns the rules; the page only draws.
+type MoveResponse = {
+  board: string,
+  legal: bool,
+  played: number,
+  reply: number,
+  turn: string,
+  status: string,
+  line: Array<number>,
+  evals: Array<Eval>,
+}
+
+type ApiError = { error: string }
+
+fn is_ongoing(b: Board) -> bool {
+  return match xox.outcome(b) {
+    Ongoing => true,
+    Draw => false,
+    Win(_w) => false,
+  }
+}
+
+fn winning_line(b: Board) -> Array<number> {
+  return match xox.outcome(b) {
+    Win(w) => w.line,
+    Draw => [],
+    Ongoing => [],
+  }
+}
+
+// Applies the human's move, then the engine's reply, and reports the result.
+fn resolve(m: MoveRequest) -> MoveResponse {
+  let start = xox.from_text(m.board)
+  let turn = xox.cell_from(m.turn)
+  let legal = m.square >= 0 && xox.is_free(start, m.square)
+  let played = match legal {
+    true => xox.place(start, m.square, turn),
+    false => start,
+  }
+  let next = xox.other(turn)
+  // A negative square is the page asking the engine to open. Any other
+  // rejected move earns no reply, so a stale click cannot gift it a turn.
+  let asked_to_open = m.square < 0
+  let engine_plays = m.level != "human" && (legal || asked_to_open) && is_ongoing(played)
+  let reply = match engine_plays {
+    true => xox.choose_move(played, next, xox.level_from(m.level)),
+    false => None,
+  }
+  let ended = match reply {
+    Some(idx) => xox.place(played, idx, next),
+    None => played,
+  }
+  let reply_square = match reply {
+    Some(idx) => idx,
+    None => -1,
+  }
+  // After an engine reply it is the human's move again; in two-player mode
+  // the turn passes; an illegal click changes nothing.
+  let passed = match legal {
+    true => next,
+    false => turn,
+  }
+  let after = match reply {
+    Some(_idx) => turn,
+    None => passed,
+  }
+  let evals = match is_ongoing(ended) {
+    true => xox.evaluate(ended, after),
+    false => [],
+  }
+  let played_square = match legal {
+    true => m.square,
+    false => -1,
+  }
+  let out: MoveResponse = {
+    board: xox.to_text(ended),
+    legal: legal,
+    played: played_square,
+    reply: reply_square,
+    turn: xox.mark(after),
+    status: xox.outcome_label(ended),
+    line: winning_line(ended),
+    evals: evals,
+  }
+  return out
+}
+
+fn move_route(req: http.Request) -> http.Response {
+  return match MoveRequest.parse(req.body) {
+    Ok(m) => http.json(200, resolve(m)),
+    Err(_issues) => bad_request(),
+  }
+}
+
+fn bad_request() -> http.Response {
+  let body: ApiError = { error: "send board, square, turn and level" }
+  return http.json(400, body)
+}
+
+// The page is three ordinary files under assets/ — no markup lives in Glyph.
+// They are read per request, so editing the CSS or JS shows up on a refresh
+// without restarting the server.
+const asset_dir: string = "assets"
+
+const html_type: string = "text/html; charset=utf-8"
+
+const css_type: string = "text/css; charset=utf-8"
+
+const js_type: string = "text/javascript; charset=utf-8"
+
+const text_type: string = "text/plain; charset=utf-8"
+
+fn asset_path(name: string) -> string {
+  return path.join([process.cwd(), asset_dir, name])
+}
+
+fn typed(status: number, body: string, mime: string) -> http.Response {
+  let r: http.Response = { status: status, headers: { "content-type": mime }, body: body, url: "" }
+  return r
+}
+
+fn serve_asset(name: string, mime: string) -> http.Response {
+  return match fs.read_text(asset_path(name)) {
+    Ok(text) => typed(200, text, mime),
+    Err(e) => missing(name, e.message),
+  }
+}
+
+fn missing(name: string, why: string) -> http.Response {
+  io.eprintln("  Could not read ${asset_dir}/${name}: ${why}")
+  return typed(500, "Missing ${asset_dir}/${name}", text_type)
+}
+
+fn handle(req: http.Request) -> Result<http.Response, string> {
+  return match http.path(req) {
+    "/" => Ok(serve_asset("index.html", html_type)),
+    "/xox.css" => Ok(serve_asset("xox.css", css_type)),
+    "/xox.js" => Ok(serve_asset("xox.js", js_type)),
+    "/api/move" => Ok(move_route(req)),
+    else => Ok(http.text(404, "no such route")),
+  }
+}
+
+pub async fn start(port: number) -> number {
+  let url = "http://localhost:${number.to_string(port)}"
+  io.println("")
+  match fs.exists(asset_path("index.html")) {
+    true => io.println("  XOX is running at ${url}"),
+    false => warn_assets(),
+  }
+  io.println("  Press ctrl-c to stop.")
+  io.println("")
+  let served = await http.serve(port, handle)
+  return match served {
+    Ok(_v) => 0,
+    Err(e) => report(e),
+  }
+}
+
+// The assets are found relative to the working directory, so say so plainly
+// rather than serving 500s that look like a code problem.
+fn warn_assets() -> void {
+  io.eprintln("  No ${asset_dir}/index.html under ${process.cwd()}")
+  io.eprintln("  Start the server from the project root.")
+}
+
+fn report(message: string) -> number {
+  io.eprintln("  Could not start the server: ${message}")
+  return 1
+}

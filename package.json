@@ -1,0 +1,17 @@
+{
+  "name": "hello",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "glyph run",
+    "build": "glyph build src --out dist"
+  },
+  "glyph": {
+    "src": "src"
+  },
+  "devDependencies": {
+    "@glyphlang/glyph": "^0.1.72",
+    "typescript": "^6.0.0",
+    "tsx": "^4.19.0"
+  }
+}

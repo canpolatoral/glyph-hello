@@ -1,0 +1,18 @@
+module main
+
+import std/array
+import cli
+import web
+
+// `glyph run` opens the browser game; `glyph run . cli` keeps the terminal
+// version, and anything after `cli` is passed straight through to it.
+async fn main(argv: Array<string>) -> number {
+  let head = match argv {
+    [] => "",
+    [first, ..._rest] => first,
+  }
+  return match head {
+    "cli" => cli.run(array.slice(argv, 1)),
+    else => await web.start(8787),
+  }
+}
