@@ -1,0 +1,1825 @@
+module ultimate_ai
+
+import std/array
+import std/option { Option, Some, None }
+import std/result { Ok, Err }
+import std/string
+import std/time
+import xox { Cell, Empty, X, O }
+import xox { Careless, Fair, Perfect }
+import xox
+import ultimate { UState, Move }
+import ultimate { MiniStatus, MiniOpen, MiniWon, MiniDrawn }
+import ultimate
+
+// ---------------------------------------------------------------------------
+// RED PHASE - the Ultimate AI (FR-4.1 .. FR-4.6, spec section 6).
+//
+// Every `pub fn` below is a signature with a deliberately wrong `// STUB:`
+// body, and every `@example` above one encodes a row of specs/test-matrix.md
+// section 4. The examples are meant to FAIL until the search is implemented;
+// the module still has to compile cleanly and `glyph check src` must keep
+// reporting xox.glyph's and ultimate.glyph's own examples as passing.
+// Search for `// STUB:` to find the work.
+//
+// Browser safety (D-1 / AC-14): the only imports are std/array, std/option,
+// std/result, std/string, std/time, xox and ultimate. No std/io, no std/fs,
+// no std/http, no DOM, no `self`, no `postMessage`.
+//
+// What a stub is allowed to be: a constant. The examples are written so that
+// no constant can satisfy them - they pin exact heuristic weights (D-A3),
+// exact PRNG values (D-A5), the move a search must find, the shape of the
+// three difficulty levels against each other (AI-L2 / AI-L3), and the
+// budget-independent depth contract (FR-4.5).
+// ---------------------------------------------------------------------------
+
+// How hard the engine tries (FR-4.3). Classic maps these onto xox.Level
+// (D-A4); Ultimate maps them onto no-search / depth 3 / iterative deepening.
+pub type Difficulty =
+  | Easy
+  | Medium
+  | Hard
+
+// What a search returns: the move, its score from the mover's point of view,
+// the deepest FULLY COMPLETED ply, and the node count (telemetry, AI-L3).
+pub type Plan = { move: Move, score: number, depth: number, nodes: number }
+
+// The PRNG walk used by the TA-007 range check.
+type Walk = { seed: number, ok: bool }
+
+// ---------------------------------------------------------------------------
+// Fixture library. Built only from the ENGINE's public API (state_from_text,
+// decode, apply_move), so these tests cannot drift from ultimate.glyph.
+// ---------------------------------------------------------------------------
+
+// EMPTY
+const p_empty: string = "........."
+
+// WX012 - MiniWon(X, [0,1,2]), closed
+const p_wx012: string = "XXXOO.O.."
+
+// WO012 - MiniWon(O, [0,1,2]), closed
+const p_wo012: string = "OOOXX.X.."
+
+// D1 - MiniDrawn
+const p_d1: string = "XXOOOXXOX"
+
+// D2 - MiniDrawn
+const p_d2: string = "OOXXXOOXO"
+
+// L1 - MiniOpen with ONE empty cell (2); X@2 wins [0,1,2]
+const p_l1: string = "XX.OOXXOO"
+
+// SP_WIN - cell 0 empty; X@0 wins [0,1,2]
+const p_sp_win: string = ".XXOO...."
+
+// B6 - the AC-35 trap board, empties {0,2,6,8}
+const p_b6: string = ".X.OXO.O."
+
+// THREAT8 - X@8 wins [2,5,8]
+const p_threat8: string = "..X.OX..."
+
+// One mini-board won by X on [0,1,2] and nothing else: the +100 probe.
+const p_xxx: string = "XXX......"
+
+// A single X on the centre cell of an open board: the +8 probe.
+const p_centre: string = "....X...."
+
+// A single X on a corner of an open board: the +2 probe.
+const p_corner: string = "X........"
+
+// Two X in a row with the third cell empty, in an open board: +5 (and the
+// corner cell 0 is worth +2, so the position is worth 7).
+const p_two: string = "XX......."
+
+// G-20: twenty legal moves, no board closed, forced Some(6), seven replies
+const g_20_text: string = "U1|X|0112233445566778800224466881133557700336"
+
+// G-CLOSED: X owns board 4 after six moves; turn X, free move
+const g_closed_text: string = "U1|X|400441144224"
+
+// G-XWIN: move 17 = (8,8) closes board 8 AND completes the meta line [0,4,8]
+const g_xwin_text: string = "U1|X|0440088000144224466444388228855888"
+
+fn grid(groups: Array<string>) -> string {
+  return string.join(groups, "/")
+}
+
+// The nine mini-board patterns of a fixture that differs from empty in one
+// board only.
+fn nine(b: number, pattern: string) -> Array<string> {
+  return array.map(
+    array.range(9),
+    fn(i: number) -> string {
+      let g = match i == b {
+        true => pattern,
+        false => p_empty,
+      }
+      return g
+    },
+  )
+}
+
+fn fx(groups: Array<string>, f: Option<number>, t: Cell) -> UState {
+  return ultimate.state_from_text(grid(groups), f, t)
+}
+
+// TA-027's S_CENTRE: board 4 won by X, nothing else, free move for O.
+fn fx_wonc() -> UState {
+  return fx(nine(4, p_wx012), None, O)
+}
+
+// TA-027's S_CORNER: the same with the won board at 0.
+fn fx_wonk() -> UState {
+  return fx(nine(0, p_wx012), None, O)
+}
+
+// TA-028's parent: board 3 closed, forced Some(0), X to move. (0,3) points at
+// the closed board 3 and hands O a free move; (0,1) does not.
+fn fx_freeparent() -> UState {
+  return fx(nine(3, p_wx012), Some(0), X)
+}
+
+// The four single-term heuristic probes (D-A3). `forced` is Some(1) in every
+// one of them so the free-move term never enters.
+fn fx_boardwon() -> UState {
+  return fx(nine(0, p_xxx), Some(1), O)
+}
+
+fn fx_centreboard() -> UState {
+  return fx(nine(4, p_xxx), Some(1), O)
+}
+
+fn fx_centrecell() -> UState {
+  return fx(nine(0, p_centre), Some(1), O)
+}
+
+fn fx_cornercell() -> UState {
+  return fx(nine(0, p_corner), Some(1), O)
+}
+
+fn fx_tworow() -> UState {
+  return fx(nine(0, p_two), Some(1), O)
+}
+
+// A mini-board win one move deep: board 3 is forced, five cells are empty and
+// (3,0) is the only one that claims the board.
+fn fx_minwin() -> UState {
+  return fx(nine(3, p_sp_win), Some(3), X)
+}
+
+// FX-WINLAST: exactly one legal move, (0,2), and it wins the mini-board.
+fn fx_winlast() -> UState {
+  return fx(nine(0, p_l1), Some(0), X)
+}
+
+// FX-TERMFORCED: X owns boards 0 and 1; (2,4) claims board 2 and the game.
+fn fx_termforced() -> UState {
+  return fx(
+    [p_wx012, p_wx012, ".X.O.O.X.", p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(2),
+    X,
+  )
+}
+
+// FX-MUSTBLOCK (TA-017): O is forced into board 6 and exactly one of the four
+// replies, (6,6), does not let X play (8,8) and win on [0,4,8] next move.
+fn fx_mustblock() -> UState {
+  return fx([p_wx012, p_d1, p_d2, p_d1, p_wx012, p_d2, p_b6, p_d1, p_threat8], Some(6), O)
+}
+
+// AI-L3's wide position: three open boards, 27 legal moves, free move, and
+// small enough that a depth-3 search in an `@example` stays cheap.
+fn fx_wide() -> UState {
+  return fx([p_empty, p_d1, p_empty, p_d2, p_wx012, p_d1, p_wo012, p_d2, p_empty], None, X)
+}
+
+// FX-TIE43 and FX-ALLDRAWN: terminal, so `choose` must answer None.
+fn fx_tie43() -> UState {
+  return fx([p_wx012, p_wx012, p_wo012, p_d1, p_wo012, p_wx012, p_wx012, p_wo012, p_d2], None, X)
+}
+
+fn fx_alldrawn() -> UState {
+  return fx([p_d1, p_d2, p_d1, p_d2, p_d1, p_d2, p_d1, p_d2, p_d1], None, O)
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers. All pure, all real logic - none of them is a stub.
+// ---------------------------------------------------------------------------
+
+fn mv(b: number, c: number) -> Move {
+  let m: Move = { board: b, cell: c }
+  return m
+}
+
+fn yn(b: bool) -> string {
+  return match b {
+    true => "true",
+    false => "false",
+  }
+}
+
+fn move_text(m: Move) -> string {
+  return "${number.to_string(m.board)}${number.to_string(m.cell)}"
+}
+
+fn n_text(n: number) -> string {
+  return number.to_string(n)
+}
+
+// A state built by replaying the first `plies` moves of a save (spec 7.1).
+fn state_at(text: string, plies: number) -> UState {
+  let head = string.slice(text, 0, 5 + plies * 2)
+  return match ultimate.decode(head) {
+    Ok(s) => s,
+    Err(_e) => ultimate.new_game(X),
+  }
+}
+
+fn g_20() -> UState {
+  return state_at(g_20_text, 20)
+}
+
+fn g_closed() -> UState {
+  return state_at(g_closed_text, 6)
+}
+
+fn g_xwin_16() -> UState {
+  return state_at(g_xwin_text, 16)
+}
+
+fn g_xwin() -> UState {
+  return state_at(g_xwin_text, 17)
+}
+
+fn after(s: UState, m: Move) -> UState {
+  return match ultimate.apply_move(s, m) {
+    Ok(next) => next,
+    Err(_e) => s,
+  }
+}
+
+// Every accessor a probe needs, total on Option<Plan>.
+fn planned(p: Option<Plan>) -> string {
+  return match p {
+    Some(plan) => move_text(plan.move),
+    None => "none",
+  }
+}
+
+fn depth_of(p: Option<Plan>) -> number {
+  return match p {
+    Some(plan) => plan.depth,
+    None => -1,
+  }
+}
+
+fn score_of(p: Option<Plan>) -> number {
+  return match p {
+    Some(plan) => plan.score,
+    None => 0,
+  }
+}
+
+fn nodes_of(p: Option<Plan>) -> number {
+  return match p {
+    Some(plan) => plan.nodes,
+    None => -1,
+  }
+}
+
+fn plan_probe(p: Option<Plan>) -> string {
+  return match p {
+    Some(plan) => "${move_text(plan.move)} ${n_text(plan.depth)} ${yn(plan.nodes > 0)}",
+    None => "none",
+  }
+}
+
+// Is `text` the two-digit form of one of `s`'s legal moves?
+fn legal_text(s: UState, text: string) -> bool {
+  let texts = array.map(ultimate.legal_moves(s), fn(m: Move) -> string { move_text(m) })
+  return array.contains(texts, text)
+}
+
+fn legal_plan(s: UState, p: Option<Plan>) -> bool {
+  return legal_text(s, planned(p))
+}
+
+// The AI-L1 spread seed set: k * 7919, never the sequential one (matrix 4.6.1).
+fn spread(k: number) -> number {
+  return (k + 1) * 7919
+}
+
+// How many DISTINCT moves a difficulty produces over `count` spread seeds.
+fn distinct_count(s: UState, d: Difficulty, count: number, budget_ms: number) -> number {
+  let texts = array.map(
+    array.range(count),
+    fn(k: number) -> string { planned(choose(s, d, spread(k), budget_ms)) },
+  )
+  let none_seen: Array<string> = []
+  let seen = array.fold(
+    texts,
+    none_seen,
+    fn(acc: Array<string>, t: string) -> Array<string> {
+      let next = match array.contains(acc, t) {
+        true => acc,
+        false => array.push(acc, t),
+      }
+      return next
+    },
+  )
+  return array.len(seen)
+}
+
+// The AI-L2 tactical suite, as (position, expected move) pairs.
+fn tactics_moves(f: fn(UState) -> string) -> string {
+  let answers = [f(g_xwin_16()), f(fx_termforced()), f(fx_minwin()), f(fx_mustblock())]
+  return string.join(answers, ",")
+}
+
+fn difficulty_text(d: Difficulty) -> string {
+  return match d {
+    Easy => "easy",
+    Medium => "medium",
+    Hard => "hard",
+  }
+}
+
+fn idx_text(o: Option<number>) -> string {
+  return match o {
+    Some(i) => n_text(i),
+    None => "-",
+  }
+}
+
+fn walk_step(w: Walk) -> Walk {
+  let n = seed_next(w.seed)
+  let good = w.ok && n >= 1 && n <= 2147483646 && n % 1 == 0
+  let next: Walk = { seed: n, ok: good }
+  return next
+}
+
+// ---------------------------------------------------------------------------
+// 1. The PRNG (D-A5, TA-007). MINSTD: x -> (x * 48271) % 2147483647.
+// 48271 * 2147483646 < 2^53, so every step is exact in a JS number; the
+// commonly copied 1103515245 multiplier is not, which is why the constant is
+// normative rather than a preference.
+// ---------------------------------------------------------------------------
+
+// TA-007 [AC-33] the multiplier is normative and the arithmetic is exact
+@example seed_next(1) == 48271
+@example seed_next(2147483646) == 2147435376
+// TA-007 [ADV] 10 000 steps from 1 stay integral and inside 1..2^31-2
+@example prng_probe() == "399268537 true"
+pub fn seed_next(x: number) -> number {
+  // MINSTD (D-A5). 48271 * 2147483646 is about 1.04e14, well under 2^53, so
+  // the product is exact in a JS number and the walk never drifts.
+  return x * 48271 % 2147483647
+}
+
+// TA-012 / TA-013 [AC-34] the exact residues the error and block rates rely on
+@example rand_below(1, 100) == 71
+@example rand_below(2, 100) == 42
+// matrix 4.6.1: over seeds 1..200, r < 15 fires on EXACTLY 30 seeds, and over
+// seeds 1..100, r < 35 fires on exactly 35 - both are bijection consequences,
+// not tolerances.
+@example rate_probe() == "30 35"
+// `rand_below(s, n) = seed_next(s) % n` (matrix 4.6.1). The second reduction
+// only matters for a negative seed: JS `%` keeps the sign, and a draw must
+// still be an index.
+pub fn rand_below(seed: number, n: number) -> number {
+  let raw = seed_next(seed) % n
+  return match n > 0 {
+    true => (raw + n) % n,
+    false => 0,
+  }
+}
+
+fn prng_probe() -> string {
+  let start: Walk = { seed: 1, ok: true }
+  let end = array.fold(
+    array.range(10000),
+    start,
+    fn(acc: Walk, _i: number) -> Walk { walk_step(acc) },
+  )
+  return "${n_text(end.seed)} ${yn(end.ok)}"
+}
+
+fn rate_probe() -> string {
+  let errors = array.filter(
+    array.range_from(1, 201),
+    fn(s: number) -> bool { rand_below(s, 100) < 15 },
+  )
+  let blocks = array.filter(
+    array.range_from(1, 101),
+    fn(s: number) -> bool { rand_below(s, 100) < 35 },
+  )
+  return "${n_text(array.len(errors))} ${n_text(array.len(blocks))}"
+}
+
+// ---------------------------------------------------------------------------
+// 2. The heuristic (FR-4.2, D-A3, AC-37, AC-40).
+//
+// Weights, per occurrence, signed for `me`:
+//   mini-board won                                          +100
+//   mini-board won and it is board 4 (the centre board)      +40 extra
+//   meta two-in-a-row whose third meta cell is still open     +60
+//   centre cell (index 4) of an OPEN mini-board                +8
+//   two-in-a-row inside an open mini-board, third cell empty   +5
+//   corner cell of an OPEN mini-board                          +2
+//   the side to move was handed a free move (forced == None) +/-12
+// Cells inside a closed board are dead and score 0 (R-3).
+// Terminal states short-circuit: +1000000 - ply for a win by `me`,
+// -1000000 + ply for a loss, 0 for a draw - no positional term at all.
+// ---------------------------------------------------------------------------
+
+// TA-029 [AC-40, FR-4.2] the four single-term positions, each isolating one
+// weight: a won corner board (100), a won CENTRE board (100+40), a centre
+// cell (8), a corner cell (2), and two-in-a-row plus its corner (5+2).
+@example terms_probe() == "100 140 8 2 7"
+// FR-4.2's ordering, spelled out on concrete positions: a won mini-board beats
+// a bare centre cell, and the centre mini-board beats a corner one.
+@example evaluate(fx_boardwon(), X) > evaluate(fx_centrecell(), X)
+@example evaluate(fx_centreboard(), X) > evaluate(fx_boardwon(), X)
+@example evaluate(fx_centrecell(), X) > evaluate(fx_tworow(), X)
+// TA-027 [AC-40] centre board vs corner board: the delta is EXACTLY the +40
+// centre bonus - both states own one board and share everything else.
+@example evaluate(fx_wonc(), X) - evaluate(fx_wonk(), X) == 40
+// TA-028 [AC-40] handing a free move costs EXACTLY 12: (0,3) points at the
+// closed board 3, (0,1) points at the open board 1, and cells 1 and 3 are
+// both edges worth nothing.
+@example evaluate(after(fx_freeparent(), mv(0, 3)), X) == evaluate(after(fx_freeparent(), mv(0, 1)), X) - 12
+// TA-024 / TA-026 [AC-37] antisymmetry, and terminal states that short-circuit
+@example antisymmetry_probe() == "0 20 true"
+@example terminal_eval_probe() == "true true true"
+// Antisymmetry is structural, not a property to be maintained by hand: every
+// term is summed in X-positive units by `score_x` and the caller's colour is
+// applied once, here. `evaluate(s, X) == -evaluate(s, O)` therefore cannot be
+// broken by adding a weight (AC-37), and neither can mirror symmetry (TA-025).
+pub fn evaluate(s: UState, me: Cell) -> number {
+  return code_of(me) * score_x(s)
+}
+
+fn terms_probe() -> string {
+  let a = n_text(evaluate(fx_boardwon(), X))
+  let b = n_text(evaluate(fx_centreboard(), X))
+  let c = n_text(evaluate(fx_centrecell(), X))
+  let d = n_text(evaluate(fx_cornercell(), X))
+  let e = n_text(evaluate(fx_tworow(), X))
+  return "${a} ${b} ${c} ${d} ${e}"
+}
+
+// Every state of G-XWIN plus the two terminal fixtures: evaluate(s, X) must be
+// exactly -evaluate(s, O) in all 20.
+fn antisymmetry_probe() -> string {
+  let states = array.map(array.range(18), fn(k: number) -> UState { state_at(g_xwin_text, k) })
+  let all = array.push(array.push(states, fx_tie43()), fx_alldrawn())
+  let broken = array.filter(all, fn(s: UState) -> bool { evaluate(s, X) != 0 - evaluate(s, O) })
+  // A constant function is antisymmetric too, so the probe also demands that
+  // twenty genuinely different positions do not all score the same.
+  let scores = array.map(all, fn(s: UState) -> string { n_text(evaluate(s, X)) })
+  let none_seen: Array<string> = []
+  let seen = array.fold(
+    scores,
+    none_seen,
+    fn(acc: Array<string>, t: string) -> Array<string> {
+      let next = match array.contains(acc, t) {
+        true => acc,
+        false => array.push(acc, t),
+      }
+      return next
+    },
+  )
+  return "${n_text(array.len(broken))} ${n_text(array.len(all))} ${yn(array.len(seen) >= 5)}"
+}
+
+fn terminal_eval_probe() -> string {
+  let won = g_xwin()
+  let a = evaluate(won, X) > 900000
+  let b = evaluate(won, O) < -900000
+  let c = evaluate(fx_alldrawn(), X) == 0
+  return "${yn(a)} ${yn(b)} ${yn(c)}"
+}
+
+// ---------------------------------------------------------------------------
+// 3. Move ordering (spec 6.6) and the one-move tactics both Easy and the
+// ordering need.
+// ---------------------------------------------------------------------------
+
+// TA-042 [G-2] the game-winning move is ordered first, and the ordering is a
+// permutation of legal_moves - never a filter.
+@example order_probe() == "88 true true"
+// Spec 6.6, as a permutation of `legal_moves` - never a filter. A terminal
+// state has no candidates, so the ordering agrees with `legal_moves` there too.
+pub fn ordered_moves(s: UState) -> Array<Move> {
+  return match ultimate.is_terminal(s) {
+    true => none_moves(),
+    false => array.map(ordered_cands(s), fn(c: Cand) -> Move { c.move }),
+  }
+}
+
+fn order_probe() -> string {
+  let s = g_xwin_16()
+  let ordered = ordered_moves(s)
+  let legal = ultimate.legal_moves(s)
+  let first = match array.len(ordered) > 0 {
+    true => move_text(ordered[0]),
+    false => "none",
+  }
+  let strays = array.filter(ordered, fn(m: Move) -> bool { !legal_text(s, move_text(m)) })
+  let same = array.len(ordered) == array.len(legal) && array.len(strays) == 0
+  let stable = move_text(ordered_moves(s)[0]) == first
+  return "${first} ${yn(same)} ${yn(stable)}"
+}
+
+// TA-008 / TA-011 [AC-32] D-A1 step 1 needs this predicate: does the move end
+// the game for the side to move? (8,8) wins on [0,4,8]; (8,1) does not.
+@example wins_now_probe() == "true false true"
+// D-A1 step 1 and the head of the move ordering: does `m` end the game in
+// `s.turn`'s favour? An illegal move never wins, so this is total.
+pub fn wins_now(s: UState, m: Move) -> bool {
+  return match ultimate.apply_move(s, m) {
+    Ok(next) => won_by(next, s.turn),
+    Err(_e) => false,
+  }
+}
+
+fn wins_now_probe() -> string {
+  let a = wins_now(g_xwin_16(), mv(8, 8))
+  let b = wins_now(g_xwin_16(), mv(8, 1))
+  let c = wins_now(fx_termforced(), mv(2, 4))
+  return "${yn(a)} ${yn(b)} ${yn(c)}"
+}
+
+// ---------------------------------------------------------------------------
+// 4. Depth-limited minimax with alpha-beta (FR-4.2).
+// ---------------------------------------------------------------------------
+
+// TA-026 [AC-37] a forced win inside the horizon is scored as a win, from
+// either colour's point of view.
+@example ab_probe() == "true true true"
+// `alphabeta` is the node function: the value of `s` to `me`, searching
+// `depth` more plies, with the (alpha, beta) window. At depth 0, or on a
+// terminal state, it is exactly `evaluate(s, me)`.
+// The node function. The engine searches in X-positive units (`ab_x`), so a
+// search for O is the same search with the window mirrored and the value
+// negated - one implementation, no duplicated min/max code to fall out of step.
+pub fn alphabeta(s: UState, me: Cell, depth: number, alpha: number, beta: number) -> number {
+  return ab_for(s, code_of(me), depth, alpha, beta, no_deadline, 0).value
+}
+
+fn ab_probe() -> string {
+  let s = g_xwin_16()
+  let lo = 0 - 1000000000
+  let hi = 1000000000
+  let a = alphabeta(s, X, 2, lo, hi) > 900000
+  let b = alphabeta(s, O, 2, lo, hi) < -900000
+  let c = alphabeta(fx_alldrawn(), X, 4, lo, hi) == 0
+  return "${yn(a)} ${yn(b)} ${yn(c)}"
+}
+
+// TA-016 [AC-34] a fixed-depth root search: the mini-board win one move deep,
+// the immediate meta win, and the two-ply win that FX-TERMFORCED holds.
+@example plan_probe(search_at(fx_minwin(), 1)) == "30 1 true"
+@example plan_probe(search_at(g_xwin_16(), 1)) == "88 1 true"
+@example plan_probe(search_at(fx_termforced(), 2)) == "24 2 true"
+// TA-017 [AC-35] the unique non-losing reply needs two plies to see
+@example planned(search_at(fx_mustblock(), 2)) == "66"
+// TA-002 [AC-31] a terminal state has no plan at any depth
+@example search_at(fx_tie43(), 3) == None
+@example search_at(fx_alldrawn(), 1) == None
+// TA-005 [AC-33] the same call twice is the same plan, and the reported depth
+// is the depth that was asked for
+@example fixed_depth_probe() == "true true 3"
+// The root of the depth-limited search: alpha-beta over `ordered_moves`, with
+// the heuristic at the horizon. `depth` is the number of plies searched;
+// `plan.depth` echoes it and `plan.nodes` counts the nodes visited.
+pub fn search_at(s: UState, depth: number) -> Option<Plan> {
+  return root_search(s, depth, no_deadline)
+}
+
+fn fixed_depth_probe() -> string {
+  let s = g_20()
+  let a = search_at(s, 3)
+  let b = search_at(s, 3)
+  let same = planned(a) == planned(b) && nodes_of(a) == nodes_of(b)
+  return "${yn(same)} ${yn(legal_plan(s, a))} ${n_text(depth_of(a))}"
+}
+
+// ---------------------------------------------------------------------------
+// 5. Iterative deepening with a time budget (FR-4.5, D-A6).
+// ---------------------------------------------------------------------------
+
+// The deadline a budget maps to. Not a stub: it is the whole of the module's
+// contact with the clock, so that everything else stays pure and replayable.
+pub fn deadline_of(budget_ms: number) -> number {
+  return time.now() + budget_ms
+}
+
+// TA-022 [AC-36, FR-4.5] the depth-1 result is computed BEFORE any clock
+// check, so a zero and even a negative budget still return a legal move.
+@example budget_probe() == "true true"
+// TA-021 [AC-36] the depth cap binds when the clock does not: an unreachable
+// budget searches exactly `max_depth` plies.
+@example cap_probe() == "1 2 4"
+// TA-023 [AC-36, D-A6] an overrunning ply is discarded WHOLE: the result of a
+// deepening run that completes ply 3 is the fixed-depth-3 result, move for
+// move - a half-searched ply cannot satisfy this.
+@example deepen_matches_fixed() == "true true"
+// TA-002 [AC-31] and a terminal state still has no plan
+@example deepen(fx_tie43(), 1000000000, 4) == None
+// Iterative deepening from depth 1 upward until `max_depth` or the budget is
+// spent. A ply that runs out of budget is discarded entirely and the previous
+// completed ply's plan is returned (D-A6), so `plan.depth` is always a ply
+// that was searched to the end.
+pub fn deepen(s: UState, budget_ms: number, max_depth: number) -> Option<Plan> {
+  let deadline = deadline_of(budget_ms)
+  let start = time.now()
+  // FR-4.5: ply 1 runs with no deadline at all, so a zero - or negative -
+  // budget still comes back with a legal move.
+  let plan = root_search(s, 1, no_deadline)
+  let last = time.now() - start
+  let stop = plan_missing(plan)
+  for d in array.range_from(2, max_depth + 1) {
+    match stop {
+      true => { break },
+      false => {},
+    }
+    // D-A6, half of it: a ply is not STARTED unless the last one's cost
+    // suggests it can finish. Measured growth per ply on this engine is 2.5x
+    // to 4.2x (tools/bench-search.mjs), so 3x is the break-even guess: too
+    // small and the budget is spent on plies that get discarded (a 1500 ms
+    // opening search burned 1.1 s that way at 2x), too large and a reachable
+    // ply is skipped. Refusing to start a doomed ply is also what keeps the
+    // reported depth stable for a given budget instead of a coin toss.
+    let room = deadline - time.now() > last * 3 + 1
+    match room {
+      true => {},
+      false => { break },
+    }
+    let started = time.now()
+    let next = root_search(s, d, deadline)
+    mut last = time.now() - started
+    // D-A6, the other half: a ply that overran is discarded WHOLE. `next` is
+    // None then, and the previous completed ply's plan is what is returned.
+    mut stop = plan_missing(next)
+    mut plan = match next {
+      Some(p) => Some(p),
+      None => plan,
+    }
+  }
+  return plan
+}
+
+fn budget_probe() -> string {
+  let s = g_20()
+  let zero = deepen(s, 0, 12)
+  let negative = deepen(s, 0 - 1, 12)
+  let a = depth_of(zero) >= 1 && legal_plan(s, zero)
+  let b = depth_of(negative) >= 1 && legal_plan(s, negative)
+  return "${yn(a)} ${yn(b)}"
+}
+
+fn cap_probe() -> string {
+  let s = g_20()
+  let huge = 1000000000
+  let a = depth_of(deepen(s, huge, 1))
+  let b = depth_of(deepen(s, huge, 2))
+  let c = depth_of(deepen(s, huge, 4))
+  return "${n_text(a)} ${n_text(b)} ${n_text(c)}"
+}
+
+fn deepen_matches_fixed() -> string {
+  let s = g_20()
+  let deepened = deepen(s, 1000000000, 3)
+  let fixed = search_at(s, 3)
+  let same_move = planned(deepened) == planned(fixed)
+  let same_depth = depth_of(deepened) == 3 && depth_of(fixed) == 3
+  return "${yn(same_move)} ${yn(same_depth)}"
+}
+
+// ---------------------------------------------------------------------------
+// 6. The three difficulty levels (FR-4.3, D-A1, D-A2, D-A6).
+// ---------------------------------------------------------------------------
+
+// TA-008 [AC-32] step 1 is unconditional: the immediate game win on all 100
+// seeds, on both win fixtures.
+@example easy_win_probe() == "true true"
+// TA-046 [G-2] Easy performs no search at all - and the move it does not
+// search for still has to be legal on a forced board.
+@example easy_nodes_probe() == "0 true"
+// TA-010 [AC-32] and whatever it does play is legal, on every seed
+@example easy_legal_probe() == "0"
+// Easy (D-A1): win if a legal move wins the game, else block with probability
+// 35%, else a uniformly random legal move. No search, ever.
+pub fn easy_plan(s: UState, seed: number) -> Option<Plan> {
+  let moves = ultimate.legal_moves(s)
+  let n = array.len(moves)
+  return match n == 0 {
+    true => None,
+    false => Some(plan_of(easy_move(s, moves, n, seed), 0, 0, 0)),
+  }
+}
+
+fn easy_win_probe() -> string {
+  let a = array.filter(
+    array.range_from(1, 101),
+    fn(sd: number) -> bool { planned(easy_plan(g_xwin_16(), sd)) != "88" },
+  )
+  let b = array.filter(
+    array.range_from(1, 101),
+    fn(sd: number) -> bool { planned(easy_plan(fx_termforced(), sd)) != "24" },
+  )
+  return "${yn(array.len(a) == 0)} ${yn(array.len(b) == 0)}"
+}
+
+fn easy_nodes_probe() -> string {
+  let s = fx_mustblock()
+  let plan = easy_plan(s, 7919)
+  return "${n_text(nodes_of(plan))} ${yn(legal_plan(s, plan))}"
+}
+
+fn easy_legal_probe() -> string {
+  let s = fx_mustblock()
+  let strays = array.filter(
+    array.range_from(1, 101),
+    fn(sd: number) -> bool { !legal_plan(s, easy_plan(s, sd)) },
+  )
+  return n_text(array.len(strays))
+}
+
+// TA-013 / TA-014 [AC-34] the deliberate error rate is EXACTLY 30 of 200
+// seeds on a seven-move position, and all 200 moves are legal.
+@example medium_rate_probe() == "30 0"
+// TA-015 [ADV, AC-34] with exactly ONE legal move the error branch must not
+// fire - a naive implementation divides by n-1 == 0 here.
+@example medium_single_probe() == "true"
+// TA-043 [G-2] Medium is a real depth-3 search: it finds both immediate wins
+// and the mini-board claim on a non-error seed (rand_below(1,100) == 71).
+@example medium_tactics_probe() == "88,24,30"
+// Medium (D-A2): alpha-beta at depth 3, then a 15% deliberate error - a
+// uniformly random legal move OTHER than the best, when more than one exists.
+pub fn medium_plan(s: UState, seed: number) -> Option<Plan> {
+  return match search_at(s, 3) {
+    Some(p) => Some(medium_slip(s, p, seed)),
+    None => None,
+  }
+}
+
+fn medium_rate_probe() -> string {
+  let s = g_20()
+  let best = planned(search_at(s, 3))
+  let moves = array.map(
+    array.range_from(1, 201),
+    fn(sd: number) -> string { planned(medium_plan(s, sd)) },
+  )
+  let errors = array.filter(moves, fn(t: string) -> bool { t != best })
+  let strays = array.filter(moves, fn(t: string) -> bool { !legal_text(s, t) })
+  return "${n_text(array.len(errors))} ${n_text(array.len(strays))}"
+}
+
+fn medium_single_probe() -> string {
+  let s = fx_winlast()
+  let wrong = array.filter(
+    array.range_from(1, 201),
+    fn(sd: number) -> bool { planned(medium_plan(s, sd)) != "02" },
+  )
+  return yn(array.len(wrong) == 0)
+}
+
+fn medium_tactics_probe() -> string {
+  let answers = [
+    planned(medium_plan(g_xwin_16(), 1)),
+    planned(medium_plan(fx_termforced(), 1)),
+    planned(medium_plan(fx_minwin(), 1)),
+  ]
+  return string.join(answers, ",")
+}
+
+// TA-042 [G-2] the tactical suite: Hard solves the immediate meta win, the
+// two-ply meta win, the mini-board claim and the unique non-losing block.
+@example hard_tactics_probe() == "88,24,30,66"
+// TA-001 [AC-31] Hard never returns an illegal move, on any position or seed.
+// A 5 ms budget is deliberate: depth 1 is computed before the first clock
+// check, so even a budget this small must produce a legal move.
+@example hard_legal_probe() == "0 45"
+// TA-003 / TA-004 / TA-005 [AC-31, AC-33] deterministic, non-mutating, and
+// blind to history: choose(s) == choose(search_root(s)) is I-6 in one line.
+@example purity_probe() == "true true true 88"
+// Hard (D-A6): iterative deepening with the budget, hard cap depth 12, no
+// deliberate error.
+// Hard makes no deliberate error, so `seed` is accepted for a uniform
+// signature across the ladder and deliberately unused: Hard's move is a
+// function of the position and the budget alone (AC-33).
+pub fn hard_plan(s: UState, seed: number, budget_ms: number) -> Option<Plan> {
+  let _unseeded = seed
+  return deepen(s, budget_ms, 12)
+}
+
+fn hard_tactics_probe() -> string {
+  return tactics_moves(fn(s: UState) -> string { planned(deepen(s, 1000000000, 4)) })
+}
+
+fn hard_legal_probe() -> string {
+  let positions = [
+    g_xwin_16(),
+    fx_minwin(),
+    fx_mustblock(),
+    fx_termforced(),
+    fx_winlast(),
+    g_closed(),
+    g_20(),
+    fx_wide(),
+    fx_freeparent(),
+  ]
+  let checks = array.flat_map(
+    positions,
+    fn(s: UState) -> Array<bool> {
+      return array.map(
+        array.range(5),
+        fn(k: number) -> bool { legal_plan(s, hard_plan(s, spread(k), 5)) },
+      )
+    },
+  )
+  let strays = array.filter(checks, fn(ok: bool) -> bool { !ok })
+  return "${n_text(array.len(strays))} ${n_text(array.len(checks))}"
+}
+
+fn purity_probe() -> string {
+  let s = g_xwin_16()
+  let before = ultimate.state_to_text(s)
+  let a = choose(s, Hard, 7919, 20)
+  let b = choose(s, Hard, 7919, 20)
+  let c = choose(ultimate.search_root(s), Hard, 7919, 20)
+  let same_text = ultimate.state_to_text(s) == before
+  let untouched = same_text && ultimate.encode(s) == ultimate.encode(g_xwin_16())
+  let deterministic = planned(a) == planned(b) && score_of(a) == score_of(b)
+  let rootless = planned(a) == planned(c)
+  return "${yn(deterministic)} ${yn(untouched)} ${yn(rootless)} ${planned(a)}"
+}
+
+// TA-002 [AC-31] None on a terminal state, for every difficulty
+@example terminal_choice_probe() == "none none none"
+// TA-045 / TA-046 [G-2] AI-L3: the three levels are behaviourally distinct.
+// Easy scatters over the 27 legal moves, Medium repeats its search's best
+// apart from the 15% error, Hard is a single deterministic move; and only
+// Easy visits zero nodes.
+@example levels_probe() == "true true true"
+@example nodes_probe() == "true true"
+// The FR-4.3 dispatcher. `None` only for a terminal state; everything else
+// returns Some(plan) whose move is legal.
+pub fn choose(s: UState, d: Difficulty, seed: number, budget_ms: number) -> Option<Plan> {
+  return match d {
+    Easy => easy_plan(s, seed),
+    Medium => medium_plan(s, seed),
+    Hard => hard_plan(s, seed, budget_ms),
+  }
+}
+
+fn terminal_choice_probe() -> string {
+  let a = planned(choose(fx_tie43(), Easy, 1, 50))
+  let b = planned(choose(fx_alldrawn(), Medium, 1, 50))
+  let c = planned(choose(g_xwin(), Hard, 1, 50))
+  return "${a} ${b} ${c}"
+}
+
+fn levels_probe() -> string {
+  let s = fx_wide()
+  let easy = distinct_count(s, Easy, 100, 0)
+  let medium = distinct_count(s, Medium, 20, 0)
+  let hard = distinct_count(s, Hard, 3, 300)
+  return "${yn(easy >= 15)} ${yn(medium <= 6)} ${yn(hard == 1)}"
+}
+
+fn nodes_probe() -> string {
+  let s = fx_wide()
+  let easy = nodes_of(choose(s, Easy, 7919, 0))
+  let medium = nodes_of(choose(s, Medium, 7919, 0))
+  let hard = nodes_of(choose(s, Hard, 7919, 200))
+  return "${yn(easy == 0)} ${yn(medium > 0 && hard > medium)}"
+}
+
+// ---------------------------------------------------------------------------
+// 7. Classic mode (FR-4.1, D-4, D-A4) and the level names (spec 6).
+// ---------------------------------------------------------------------------
+
+// TA-030 / TA-031 / TA-032 [AC-38] the Classic ladder is xox's own three
+// examples, reached through the Ultimate difficulty names: Easy -> Careless,
+// Medium -> Fair, Hard -> Perfect. xox.glyph itself is not touched.
+@example classic_probe() == "2 2 -"
+// TA-033 [AC-38] and the mapping agrees with xox on every board it is given
+@example classic_agrees_probe() == "0 18"
+// D-A4: the Classic ladder is xox's own, reached through the Ultimate names.
+// `Perfect` is already the full-depth minimax FR-4.1 asks for, so Classic
+// needs no search of its own and `xox.glyph` stays frozen (D-4).
+pub fn classic_choose(b: xox.Board, me: Cell, d: Difficulty) -> Option<number> {
+  let level = match d {
+    Easy => Careless,
+    Medium => Fair,
+    Hard => Perfect,
+  }
+  return xox.choose_move(b, me, level)
+}
+
+fn classic_probe() -> string {
+  let a = idx_text(classic_choose(xox.from_text("OO.XX...."), O, Easy))
+  let b = idx_text(classic_choose(xox.from_text("XX......."), O, Medium))
+  let c = idx_text(classic_choose(xox.from_text("XOXXOOOXX"), X, Hard))
+  return "${a} ${b} ${c}"
+}
+
+fn classic_agrees_probe() -> string {
+  let boards = array.map(
+    ["XX.OO", "XOXOXO", "X...O...X", "XXOOOXXOX", "XOX.O.X..", "OO.XX...."],
+    fn(t: string) -> xox.Board { xox.from_text(t) },
+  )
+  let pairs = array.flat_map(
+    boards,
+    fn(b: xox.Board) -> Array<bool> {
+      let easy = idx_text(classic_choose(b, X, Easy)) == idx_text(xox.choose_move(b, X, Careless))
+      let medium = idx_text(classic_choose(b, X, Medium)) == idx_text(xox.choose_move(b, X, Fair))
+      let hard = idx_text(classic_choose(b, X, Hard)) == idx_text(xox.choose_move(b, X, Perfect))
+      return [easy, medium, hard]
+    },
+  )
+  let wrong = array.filter(pairs, fn(ok: bool) -> bool { !ok })
+  return "${n_text(array.len(wrong))} ${n_text(array.len(pairs))}"
+}
+
+// TA-035 [ADV] the parser is total and its default is Hard, case included
+@example difficulty_probe() == "easy,medium,hard,hard,hard,hard"
+// Total, case-sensitive, and defaulting to Hard: an unrecognised setting must
+// never silently weaken the opponent.
+pub fn difficulty_from(text: string) -> Difficulty {
+  return match text {
+    "easy" => Easy,
+    "medium" => Medium,
+    else => Hard,
+  }
+}
+
+fn difficulty_probe() -> string {
+  let names = ["easy", "medium", "hard", "HARD", "", "perfect"]
+  let mapped = array.map(names, fn(t: string) -> string { difficulty_text(difficulty_from(t)) })
+  return string.join(mapped, ",")
+}
+
+// ---------------------------------------------------------------------------
+// 8. Internals: the search core.
+//
+// Two rules shape everything below.
+//
+// (a) EVERYTHING IS SCORED IN X-POSITIVE UNITS. `score_x` returns a number
+//     that is positive when X stands better, and the caller's colour is
+//     applied exactly once, in `evaluate`. Antisymmetry (AC-37) and mirror
+//     symmetry (TA-025) are then properties of the shape of the code, not
+//     invariants somebody has to remember when adding a weight.
+//
+// (b) THE HOT PATH IS WRITTEN TIGHT. `evaluate` runs once per leaf and reads
+//     ~300 cells doing it, so the scanners below use `for` + `mut`
+//     accumulators and numeric cell codes (X = 1, O = -1, empty = 0) instead
+//     of the `map`/`filter`/`fold` closure chains the rules engine uses. The
+//     measured difference is a factor of ~4 in nodes per second, which is one
+//     extra ply inside the same budget. `mut` never escapes a function here:
+//     every array it writes to was allocated a line or two earlier and has not
+//     been handed to anyone (I-3 still holds, `UState` is still immutable).
+// ---------------------------------------------------------------------------
+
+// A node's value, the running node count, and whether the budget cut the
+// subtree short. `stopped` is what makes "discard the overrunning ply whole"
+// (D-A6) expressible: it propagates to the root and the ply is thrown away.
+type Node = { value: number, nodes: number, stopped: bool }
+
+// A legal move, the state it leads to, and its ordering bucket (spec 6.6).
+// The child is built once and reused by the search, so ordering costs no
+// extra `apply_move`.
+type Cand = { move: Move, state: UState, rank: number }
+
+// A win is worth a million; the ply term makes the engine prefer a win now
+// over the same win later, and a loss later over a loss now.
+const win_big: number = 1000000
+
+// The search window's bounds. Every real score is inside +/- win_big, so
+// these are unreachable rather than merely large.
+const neg_inf: number = 0 - 1000000000
+
+const pos_inf: number = 1000000000
+
+// A deadline no clock will reach (epoch ms, year 33658): the "no time limit"
+// spelling for the fixed-depth entry points.
+const no_deadline: number = 1000000000000000
+
+// ---------------------------------------------------------------------------
+// 8.1 Numeric views of the domain types.
+// ---------------------------------------------------------------------------
+
+// X = 1, O = -1, empty = 0. Every scan below is arithmetic on these: a line
+// summing to 2 can only be two X and one empty cell, which is one addition
+// instead of three string comparisons through `xox.same`.
+fn code_of(c: Cell) -> number {
+  return match c {
+    X => 1,
+    O => 0 - 1,
+    Empty => 0,
+  }
+}
+
+fn cell_of(code: number) -> Cell {
+  return match code > 0 {
+    true => X,
+    false => O,
+  }
+}
+
+// Mini-board status as a number: 0 open, 1 won by X, -1 won by O, 2 drawn.
+// One array of these answers every question `outcome` asks.
+fn status_code(st: MiniStatus) -> number {
+  return match st {
+    MiniOpen => 0,
+    MiniDrawn => 2,
+    MiniWon(w) => code_of(w.winner),
+  }
+}
+
+// Who owns the meta cell: a drawn board is claimed by nobody (R-6).
+fn claim_from(code: number) -> number {
+  return match code == 2 {
+    true => 0,
+    false => code,
+  }
+}
+
+fn statuses(s: UState) -> Array<number> {
+  return array.map(s.boards, fn(st: MiniStatus) -> number { status_code(st) })
+}
+
+fn none_moves() -> Array<Move> {
+  let empty: Array<Move> = []
+  return empty
+}
+
+fn plan_of(m: Move, score: number, depth: number, nodes: number) -> Plan {
+  let p: Plan = { move: m, score: score, depth: depth, nodes: nodes }
+  return p
+}
+
+fn node_of(value: number, nodes: number, stopped: bool) -> Node {
+  let n: Node = { value: value, nodes: nodes, stopped: stopped }
+  return n
+}
+
+fn plan_missing(p: Option<Plan>) -> bool {
+  return match p {
+    Some(_p) => false,
+    None => true,
+  }
+}
+
+fn same_move(a: Move, b: Move) -> bool {
+  return a.board == b.board && a.cell == b.cell
+}
+
+fn won_by(s: UState, who: Cell) -> bool {
+  return match ultimate.winner(s) {
+    Some(w) => xox.same(w, who),
+    None => false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8.2 The heuristic (spec 6.5, D-A3).
+// ---------------------------------------------------------------------------
+
+fn score_x(s: UState) -> number {
+  return match terminal_x(s) {
+    Some(v) => v,
+    None => positional_x(s),
+  }
+}
+
+// The meta line one mark holds outright, as 1 / -1 / 0. The first line in
+// `xox.win_lines` order wins, which is how `ultimate.outcome` resolves the
+// two-line state E-17 can build.
+fn meta_winner(sts: Array<number>) -> number {
+  let lines = xox.win_lines
+  let found = 0
+  for line in lines {
+    let sum = claim_from(sts[line[0]]) + claim_from(sts[line[1]]) + claim_from(sts[line[2]])
+    mut found = match found == 0 && sum == 3 {
+      true => 1,
+      false => match found == 0 && sum == 0 - 3 {
+        true => 0 - 1,
+        false => found,
+      },
+    }
+  }
+  return found
+}
+
+fn count_open(sts: Array<number>) -> number {
+  let n = 0
+  for code in sts {
+    mut n = match code == 0 {
+      true => n + 1,
+      false => n,
+    }
+  }
+  return n
+}
+
+fn count_claims(sts: Array<number>, who: number) -> number {
+  let n = 0
+  for code in sts {
+    mut n = match claim_from(code) == who {
+      true => n + 1,
+      false => n,
+    }
+  }
+  return n
+}
+
+// How many plies have been played, read off the board rather than off
+// `history`: the search runs from `search_root` (D-U5), where history is
+// empty, so a ply term that read history would be wrong by the whole game.
+fn filled_count(s: UState) -> number {
+  let cells = s.cells
+  let n = 0
+  for c in cells {
+    mut n = match code_of(c) == 0 {
+      true => n,
+      false => n + 1,
+    }
+  }
+  return n
+}
+
+// The terminal value in X-positive units, or None while the game is playing.
+// The meta-line scan comes first, then "any board still open", then the D-U4
+// tiebreak - the same order as `ultimate.outcome`, which `terminal_agrees_probe`
+// pins on every fixture.
+fn terminal_x(s: UState) -> Option<number> {
+  let sts = statuses(s)
+  let line_winner = meta_winner(sts)
+  let settled: Option<number> = match line_winner != 0 {
+    true => Some(line_winner),
+    false => match count_open(sts) == 0 {
+      true => Some(tiebreak_x(sts)),
+      false => None,
+    },
+  }
+  return match settled {
+    Some(w) => Some(w * (win_big - filled_count(s))),
+    None => None,
+  }
+}
+
+// D-U4 / spec 4.6: a full meta-grid with no line goes to whoever owns more
+// mini-boards; equal tallies are a draw, worth exactly 0.
+fn tiebreak_x(sts: Array<number>) -> number {
+  let x_won = count_claims(sts, 1)
+  let o_won = count_claims(sts, 0 - 1)
+  return match x_won > o_won {
+    true => 1,
+    false => match o_won > x_won {
+      true => 0 - 1,
+      false => 0,
+    },
+  }
+}
+
+// The positional sum, in X-positive units. Each weight carries the reason it
+// has the value it has; the ORDERING between them is FR-4.2's, the exact
+// numbers are D-A3's.
+fn positional_x(s: UState) -> number {
+  let codes = array.map(s.cells, fn(c: Cell) -> number { code_of(c) })
+  let sts = statuses(s)
+  let total = 0
+  for b in array.range(9) {
+    let code = sts[b]
+    let claim = claim_from(code)
+    // +100 a claimed mini-board: the only term that is a step towards the
+    // actual win condition, so it outranks every positional one.
+    mut total = total + 100 * claim
+    // +40 more for the centre board: it sits on four of the eight meta lines,
+    // twice as many as a corner board.
+    mut total = total + match b == 4 {
+      true => 40 * claim,
+      false => 0,
+    }
+    // Cells inside a closed board are dead and score nothing (R-3), so only
+    // an open board contributes cell terms.
+    mut total = total + match code == 0 {
+      true => board_terms(codes, b * 9),
+      false => 0,
+    }
+  }
+  mut total = total + meta_threats(sts)
+  // +/-12 for the free move: worth more than any single cell and less than
+  // any board, because being sent to a board of your own choosing is a real
+  // but recoverable edge. Signed for whoever is on move: `forced == None`
+  // means the side to move was handed the choice (spec 6.5).
+  mut total = total + match s.forced {
+    Some(_b) => 0,
+    None => 12 * code_of(s.turn),
+  }
+  return total
+}
+
+// The cell terms of ONE open mini-board, `base` being b * 9.
+fn board_terms(codes: Array<number>, base: number) -> number {
+  let lines = xox.win_lines
+  // +8 the centre cell: it belongs to four of the eight lines. +2 a corner:
+  // three lines each. Both rank below a two-in-a-row, which is one move from
+  // claiming the board.
+  let total = 8 * codes[base + 4] + 2 * (codes[base] + codes[base + 2] + codes[base + 6] + codes[base + 8])
+  for line in lines {
+    // +5 two of one mark with the third cell empty. With X = 1, O = -1 and
+    // empty = 0, a line summing to +2 can only be exactly that.
+    let sum = codes[base + line[0]] + codes[base + line[1]] + codes[base + line[2]]
+    mut total = total + match sum == 2 {
+      true => 5,
+      false => match sum == 0 - 2 {
+        true => 0 - 5,
+        false => 0,
+      },
+    }
+  }
+  return total
+}
+
+// +/-60 for two claimed meta cells in a line whose third is still OPEN. A
+// third cell that is drawn or claimed by the opponent is dead, and the threat
+// scores nothing - which is why this cannot be folded into `board_terms`.
+fn meta_threats(sts: Array<number>) -> number {
+  let lines = xox.win_lines
+  let total = 0
+  for line in lines {
+    let a = sts[line[0]]
+    let b = sts[line[1]]
+    let c = sts[line[2]]
+    let sum = claim_from(a) + claim_from(b) + claim_from(c)
+    // Exactly one of the three is unclaimed when the sum is +/-2, and it is
+    // the only one that can carry the code 0 (open).
+    let third_open = a == 0 || b == 0 || c == 0
+    mut total = total + match sum == 2 && third_open {
+      true => 60,
+      false => match sum == 0 - 2 && third_open {
+        true => 0 - 60,
+        false => 0,
+      },
+    }
+  }
+  return total
+}
+
+// ---------------------------------------------------------------------------
+// 8.3 The search's own move generator and child builder.
+//
+// `ultimate.apply_move` validates five ways and rebuilds nine board statuses
+// through `array.map` closures; the search already knows its moves are legal,
+// so it uses the tighter pair below. They are not a second set of rules:
+// `engine_agrees_probe` compares them against the engine's own `legal_moves`
+// and `apply_move` on every fixture, move by move.
+// ---------------------------------------------------------------------------
+
+fn board_usable(s: UState, b: number) -> bool {
+  let allowed = match s.forced {
+    Some(f) => f == b,
+    None => true,
+  }
+  return allowed && status_code(s.boards[b]) == 0
+}
+
+// Every empty cell of every playable board, ascending by board then cell.
+// Assumes a non-terminal state: the callers check that first (I-7).
+fn moves_fast(s: UState) -> Array<Move> {
+  let out: Array<Move> = []
+  for b in array.range(9) {
+    let usable = board_usable(s, b)
+    for i in array.range(9) {
+      let take = usable && code_of(s.cells[b * 9 + i]) == 0
+      match take {
+        true => { mut out.push(mv(b, i)) },
+        false => {},
+      }
+    }
+  }
+  return out
+}
+
+// The status of ONE mini-board, scanned from the cells. R-4: the win test
+// runs before the fullness test, so the move that fills the last cell AND
+// completes a line is MiniWon, never MiniDrawn.
+fn mini_status_fast(cells: Array<Cell>, b: number) -> MiniStatus {
+  let lines = xox.win_lines
+  let base = b * 9
+  let won = 0
+  let hit: Array<number> = []
+  for line in lines {
+    let a = code_of(cells[base + line[0]])
+    let second = code_of(cells[base + line[1]])
+    let third = code_of(cells[base + line[2]])
+    let complete = a != 0 && a == second && a == third
+    // The first line in `xox.win_lines` order wins, as in `status_from`.
+    mut hit = match complete && won == 0 {
+      true => line,
+      false => hit,
+    }
+    mut won = match complete && won == 0 {
+      true => a,
+      false => won,
+    }
+  }
+  let empties = 0
+  for i in array.range(9) {
+    mut empties = match code_of(cells[base + i]) == 0 {
+      true => empties + 1,
+      false => empties,
+    }
+  }
+  return match won != 0 {
+    true => MiniWon({ winner: cell_of(won), line: hit }),
+    false => match empties == 0 {
+      true => MiniDrawn,
+      false => MiniOpen,
+    },
+  }
+}
+
+// The child state of a move already known to be legal. The two arrays are
+// copied and then written once each, before either has escaped, so the parent
+// is untouched (FR-3.3) and no deep copy happens.
+//
+// `history` is SHARED with the parent rather than appended to: the rules never
+// read it (I-6), the search runs from `search_root` where it is empty (D-U5),
+// and a search state never reaches persistence or the worker boundary.
+fn play_fast(s: UState, m: Move) -> UState {
+  let cells = array.slice(s.cells, 0, 81)
+  mut cells[m.board * 9 + m.cell] = s.turn
+  let boards = array.slice(s.boards, 0, 9)
+  mut boards[m.board] = mini_status_fast(cells, m.board)
+  // D-U3 / I-4: `forced` is normalised on write, against the POST-move status
+  // of the board the move points at.
+  let points_open = status_code(boards[m.cell]) == 0
+  let next_forced: Option<number> = match points_open {
+    true => Some(m.cell),
+    false => None,
+  }
+  let next: UState = {
+    cells: cells,
+    boards: boards,
+    forced: next_forced,
+    turn: xox.other(s.turn),
+    history: s.history,
+  }
+  return next
+}
+
+// Can `who` claim mini-board `b` with one move? Two of their marks and an
+// empty third, i.e. a line summing to 2 * who.
+fn threat_in(s: UState, b: number, who: number) -> bool {
+  let lines = xox.win_lines
+  let base = b * 9
+  let found = false
+  for line in lines {
+    let sum = code_of(s.cells[base + line[0]]) + code_of(s.cells[base + line[1]]) + code_of(
+      s.cells[base + line[2]],
+    )
+    mut found = match sum == 2 * who {
+      true => true,
+      false => found,
+    }
+  }
+  return found
+}
+
+// Can the side to move claim SOME mini-board on this move? Used by Easy's
+// blocking step (D-A1) - never by the search, which reasons about it through
+// the evaluation instead.
+fn can_claim_now(s: UState) -> bool {
+  let who = code_of(s.turn)
+  let found = false
+  for b in array.range(9) {
+    mut found = match board_usable(s, b) && threat_in(s, b, who) {
+      true => true,
+      false => found,
+    }
+  }
+  return found
+}
+
+fn wins_x(s: UState, mover: number) -> bool {
+  return match terminal_x(s) {
+    Some(v) => v * mover > 0,
+    None => false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8.4 Move ordering (spec 6.6).
+// ---------------------------------------------------------------------------
+
+fn cand_of(s: UState, m: Move) -> Cand {
+  let child = play_fast(s, m)
+  let c: Cand = { move: m, state: child, rank: rank_of(s, m, child) }
+  return c
+}
+
+// 0 wins the game, 1 claims a mini-board, 2 sends the opponent to a board
+// where they have no immediate claim, 3 takes the centre cell, 4 everything
+// else. Ties keep ascending (board, cell) order, so the search is reproducible.
+fn rank_of(s: UState, m: Move, child: UState) -> number {
+  let mover = code_of(s.turn)
+  let touched = status_code(child.boards[m.board])
+  let claimed = claim_from(touched) == mover
+  // A meta line can only complete on a move that closed a board, so the full
+  // terminal test runs only when one did - most moves skip it entirely.
+  let ends_it = match touched != 0 {
+    true => wins_x(child, mover),
+    false => false,
+  }
+  let safe = match child.forced {
+    Some(t) => !threat_in(child, t, code_of(child.turn)),
+    None => false,
+  }
+  return match ends_it {
+    true => 0,
+    false => match claimed {
+      true => 1,
+      false => match safe {
+        true => 2,
+        false => match m.cell == 4 {
+          true => 3,
+          false => 4,
+        },
+      },
+    },
+  }
+}
+
+// Bucket sort by rank. Five filters beat a comparison sort here: they are
+// linear, they need no comparator closure per pair, and they preserve the
+// ascending (board, cell) order `moves_fast` produced inside each bucket.
+fn ordered_cands(s: UState) -> Array<Cand> {
+  let moves = moves_fast(s)
+  let ranked = array.map(moves, fn(m: Move) -> Cand { cand_of(s, m) })
+  return match array.len(ranked) < 2 {
+    true => ranked,
+    false => bucketed(ranked),
+  }
+}
+
+fn bucketed(ranked: Array<Cand>) -> Array<Cand> {
+  let r0 = array.filter(ranked, fn(c: Cand) -> bool { c.rank == 0 })
+  let r1 = array.filter(ranked, fn(c: Cand) -> bool { c.rank == 1 })
+  let r2 = array.filter(ranked, fn(c: Cand) -> bool { c.rank == 2 })
+  let r3 = array.filter(ranked, fn(c: Cand) -> bool { c.rank == 3 })
+  let r4 = array.filter(ranked, fn(c: Cand) -> bool { c.rank == 4 })
+  let head = array.concat(array.concat(r0, r1), r2)
+  return array.concat(array.concat(head, r3), r4)
+}
+
+// ---------------------------------------------------------------------------
+// 8.5 Alpha-beta.
+// ---------------------------------------------------------------------------
+
+fn flip(n: Node) -> Node {
+  return node_of(0 - n.value, n.nodes, n.stopped)
+}
+
+// The value of `s` to the side whose code is `sign`. Searching for O is
+// searching for X with the window mirrored and the answer negated, so there
+// is exactly one min/max implementation in the file.
+fn ab_for(
+  s: UState,
+  sign: number,
+  depth: number,
+  alpha: number,
+  beta: number,
+  deadline: number,
+  nodes: number,
+) -> Node {
+  return match sign > 0 {
+    true => ab_x(s, depth, alpha, beta, deadline, nodes),
+    false => flip(ab_x(s, depth, 0 - beta, 0 - alpha, deadline, nodes)),
+  }
+}
+
+fn ab_x(s: UState, depth: number, alpha: number, beta: number, deadline: number, nodes: number) -> Node {
+  let count = nodes + 1
+  return match terminal_x(s) {
+    Some(v) => node_of(v, count, false),
+    None => ab_open(s, depth, alpha, beta, deadline, count),
+  }
+}
+
+fn ab_open(s: UState, depth: number, alpha: number, beta: number, deadline: number, nodes: number) -> Node {
+  return match depth <= 0 {
+    true => node_of(positional_x(s), nodes, false),
+    false => ab_timed(s, depth, alpha, beta, deadline, nodes),
+  }
+}
+
+// Spec 6.4: the clock is read on entry to a node with two or more plies left,
+// never at a leaf, where reading it would cost more than the node does. `&&`
+// short-circuits, so a depth-1 node makes no call at all.
+fn ab_timed(s: UState, depth: number, alpha: number, beta: number, deadline: number, nodes: number) -> Node {
+  let expired = depth >= 2 && time.now() > deadline
+  return match expired {
+    true => node_of(0, nodes, true),
+    false => ab_scan(s, depth, alpha, beta, deadline, nodes),
+  }
+}
+
+fn ab_scan(s: UState, depth: number, alpha: number, beta: number, deadline: number, nodes: number) -> Node {
+  let maximizing = code_of(s.turn) > 0
+  let cands = ordered_cands(s)
+  let best = match maximizing {
+    true => neg_inf,
+    false => pos_inf,
+  }
+  let a = alpha
+  let b = beta
+  let count = nodes
+  let halted = false
+  let cut = false
+  for c in cands {
+    match cut || halted {
+      true => { break },
+      false => {},
+    }
+    let r = ab_x(c.state, depth - 1, a, b, deadline, count)
+    mut count = r.nodes
+    mut halted = r.stopped
+    // A halted child carries no value, so it never updates the window: the
+    // whole ply is about to be thrown away by `deepen`.
+    mut best = match halted {
+      true => best,
+      false => better(maximizing, best, r.value),
+    }
+    mut a = match maximizing && !halted && best > a {
+      true => best,
+      false => a,
+    }
+    mut b = match !maximizing && !halted && best < b {
+      true => best,
+      false => b,
+    }
+    mut cut = a >= b
+  }
+  return node_of(best, count, halted)
+}
+
+fn better(maximizing: bool, current: number, candidate: number) -> number {
+  return match maximizing {
+    true => match candidate > current {
+      true => candidate,
+      false => current,
+    },
+    false => match candidate < current {
+      true => candidate,
+      false => current,
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8.6 The root.
+// ---------------------------------------------------------------------------
+
+// I-6 / D-U5: the search starts from the same position with no history, so
+// `choose(s)` and `choose(search_root(s))` are the same call (TA-004) and the
+// clone cost never grows with the length of the game.
+fn root_search(s: UState, depth: number, deadline: number) -> Option<Plan> {
+  let root = ultimate.search_root(s)
+  return match terminal_x(root) {
+    Some(_v) => None,
+    None => root_scan(root, depth, deadline),
+  }
+}
+
+// The root keeps a full window on the beta side (nothing above it can cut) and
+// raises alpha as it improves. `>` rather than `>=` keeps the FIRST best move
+// in `ordered_cands` order, which is what makes two identical calls return an
+// identical plan (AC-33) and a deepening run agree with a fixed-depth one
+// move for move (TA-023).
+fn root_scan(s: UState, depth: number, deadline: number) -> Option<Plan> {
+  let sign = code_of(s.turn)
+  let cands = ordered_cands(s)
+  let best: Option<Move> = None
+  let best_value = neg_inf
+  let alpha = neg_inf
+  let count = 1
+  let halted = false
+  for c in cands {
+    match halted {
+      true => { break },
+      false => {},
+    }
+    let r = ab_for(c.state, sign, depth - 1, alpha, pos_inf, deadline, count)
+    mut count = r.nodes
+    mut halted = r.stopped
+    let take = !halted && (plan_none(best) || r.value > best_value)
+    mut best_value = match take {
+      true => r.value,
+      false => best_value,
+    }
+    mut best = match take {
+      true => Some(c.move),
+      false => best,
+    }
+    mut alpha = match take && r.value > alpha {
+      true => r.value,
+      false => alpha,
+    }
+  }
+  // D-A6: an interrupted ply produces nothing at all, not a partial best.
+  return match halted {
+    true => None,
+    false => match best {
+      Some(m) => Some(plan_of(m, best_value, depth, count)),
+      None => None,
+    },
+  }
+}
+
+fn plan_none(m: Option<Move>) -> bool {
+  return match m {
+    Some(_x) => false,
+    None => true,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8.7 The Easy and Medium decision procedures.
+// ---------------------------------------------------------------------------
+
+// D-A1, in order. No search: the only lookahead is the one-move win test and
+// the one-move block test, both of which are single scans.
+fn easy_move(s: UState, moves: Array<Move>, n: number, seed: number) -> Move {
+  let wins = array.filter(moves, fn(m: Move) -> bool { wins_now(s, m) })
+  // Step 2 fires on 35 of every 100 sequential seeds, exactly (matrix 4.6.1).
+  let blocks = match rand_below(seed, 100) < 35 {
+    true => blocking_moves(s, moves),
+    false => none_moves(),
+  }
+  // Step 3 draws from the NEXT value of the generator, so the "do I block?"
+  // decision and the uniform pick are independent draws rather than two
+  // readings of the same residue.
+  let random = moves[rand_below(seed_next(seed), n)]
+  let quiet = match array.len(blocks) > 0 {
+    true => blocks[0],
+    false => random,
+  }
+  return match array.len(wins) > 0 {
+    true => wins[0],
+    false => quiet,
+  }
+}
+
+// The moves that deny the opponent an immediate mini-board claim - but only
+// when some other move would have allowed one. If every reply is safe there is
+// nothing to block, and Easy should not collapse onto the lowest-indexed move.
+fn blocking_moves(s: UState, moves: Array<Move>) -> Array<Move> {
+  let risky = array.filter(moves, fn(m: Move) -> bool { can_claim_now(play_fast(s, m)) })
+  return match array.len(risky) > 0 {
+    true => array.filter(moves, fn(m: Move) -> bool { !can_claim_now(play_fast(s, m)) }),
+    false => none_moves(),
+  }
+}
+
+// D-A2's deliberate error: 15% of seeds play a uniformly random move that is
+// NOT the search's best. With one legal move there is no such move, and the
+// branch cannot fire - the empty candidate list is the guard, not a special
+// case (TA-015).
+fn medium_slip(s: UState, p: Plan, seed: number) -> Plan {
+  let others = array.filter(ultimate.legal_moves(s), fn(m: Move) -> bool { !same_move(m, p.move) })
+  let n = array.len(others)
+  let slip = rand_below(seed, 100) < 15 && n > 0
+  let picked = match slip {
+    true => others[rand_below(seed_next(seed), n)],
+    false => p.move,
+  }
+  return plan_of(picked, p.score, p.depth, p.nodes)
+}
+
+// ---------------------------------------------------------------------------
+// 8.8 The probes that pin the fast core to the engine.
+//
+// The search does not go through `ultimate.apply_move`, so these two examples
+// are what stops it becoming a second, divergent set of rules.
+// ---------------------------------------------------------------------------
+
+fn probe_states() -> Array<UState> {
+  return [
+    g_20(),
+    g_closed(),
+    g_xwin_16(),
+    fx_wide(),
+    fx_minwin(),
+    fx_mustblock(),
+    fx_termforced(),
+    fx_winlast(),
+    fx_freeparent(),
+    fx_wonc(),
+    fx_wonk(),
+    fx_boardwon(),
+    fx_centreboard(),
+    fx_centrecell(),
+    fx_tworow(),
+  ]
+}
+
+fn status_word(st: MiniStatus) -> string {
+  return match st {
+    MiniOpen => "open",
+    MiniDrawn => "drawn",
+    MiniWon(w) => "${xox.mark(w.winner)}${line_text(w.line)}",
+  }
+}
+
+fn moves_word(ms: Array<Move>) -> string {
+  let parts = array.map(ms, fn(m: Move) -> string { move_text(m) })
+  return string.join(parts, ",")
+}
+
+fn line_text(ns: Array<number>) -> string {
+  let parts = array.map(ns, fn(n: number) -> string { n_text(n) })
+  return string.join(parts, "-")
+}
+
+fn boards_word(s: UState) -> string {
+  let parts = array.map(s.boards, fn(st: MiniStatus) -> string { status_word(st) })
+  return string.join(parts, ",")
+}
+
+// Everything the rules can see, except history - which `play_fast` shares with
+// the parent on purpose (I-6).
+fn same_position(a: UState, b: UState) -> bool {
+  return ultimate.state_to_text(a) == ultimate.state_to_text(b)
+    && idx_text(a.forced) == idx_text(b.forced)
+    && xox.same(a.turn, b.turn)
+    && boards_word(a) == boards_word(b)
+}
+
+fn child_agrees(s: UState, m: Move) -> bool {
+  return match ultimate.apply_move(s, m) {
+    Ok(slow) => same_position(play_fast(s, m), slow),
+    Err(_e) => false,
+  }
+}
+
+fn child_mismatches(s: UState) -> number {
+  let bad = array.filter(ultimate.legal_moves(s), fn(m: Move) -> bool { !child_agrees(s, m) })
+  return array.len(bad)
+}
+
+// GREEN [FR-3.2, I-7] the search's generator and child builder agree with the
+// engine's own, move for move, on every fixture in the file.
+@example engine_agrees_probe() == "0 0 15"
+fn engine_agrees_probe() -> string {
+  let states = probe_states()
+  let bad_moves = array.filter(
+    states,
+    fn(s: UState) -> bool { moves_word(moves_fast(s)) != moves_word(ultimate.legal_moves(s)) },
+  )
+  let bad_children = array.filter(states, fn(s: UState) -> bool { child_mismatches(s) > 0 })
+  return "${n_text(array.len(bad_moves))} ${n_text(array.len(bad_children))} ${n_text(array.len(states))}"
+}
+
+// GREEN [AC-37] the heuristic's terminal short-circuit agrees with
+// `ultimate.outcome` - both on WHETHER the game is over and on who won.
+@example terminal_agrees_probe() == "0 20"
+fn terminal_agrees_probe() -> string {
+  let extra: Array<UState> = [fx_tie43(), fx_alldrawn(), g_xwin(), fx_winlast(), fx_wide()]
+  let states = array.concat(probe_states(), extra)
+  let bad = array.filter(states, fn(s: UState) -> bool { !terminal_agrees(s) })
+  return "${n_text(array.len(bad))} ${n_text(array.len(states))}"
+}
+
+fn terminal_agrees(s: UState) -> bool {
+  let mine = terminal_x(s)
+  let over = match mine {
+    Some(_v) => true,
+    None => false,
+  }
+  let sign = match mine {
+    Some(v) => sign_of(v),
+    None => 0,
+  }
+  let theirs = match ultimate.winner(s) {
+    Some(w) => code_of(w),
+    None => 0,
+  }
+  return over == ultimate.is_terminal(s) && sign == theirs
+}
+
+fn sign_of(v: number) -> number {
+  return match v > 0 {
+    true => 1,
+    false => match v < 0 {
+      true => 0 - 1,
+      false => 0,
+    },
+  }
+}

@@ -1,2 +1,6 @@
 dist/
 node_modules/
+assets/engine/
+
+# Session transcripts: kept locally, not published.
+archive/

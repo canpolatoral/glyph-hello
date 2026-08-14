@@ -1,0 +1,1552 @@
+module ultimate
+
+import std/array
+import std/option { Option, Some, None }
+import std/result { Result, Ok, Err }
+import std/string
+import xox { Cell, Empty, X, O }
+import xox
+
+// ---------------------------------------------------------------------------
+// RED PHASE. Every `pub fn` below is a deliberately wrong `// STUB:` and every
+// `@example` above it encodes a case from specs/test-matrix.md. The examples
+// are meant to FAIL until the engine is implemented; the module still has to
+// compile cleanly. Search for `// STUB:` to find the work.
+//
+// Documented decisions this file pins (gaps G-1 .. G-4 of the test matrix):
+//   * state_to_text emits the `/`-separated 9x9 grid form (89 chars), which is
+//     exactly what state_from_text consumes (matrix 1.1).
+//   * state_from_text sets `history: []` (G-1), so fixture states must never
+//     reach persistence or the worker boundary.
+//   * playable_boards on a terminal state is `[]` (G-3).
+//   * decode trims surrounding whitespace before parsing (G-4, lenient).
+//   * `-0` is the number 0 and therefore an in-range coordinate, so it is
+//     accepted; only non-integers, out-of-range values and non-finite values
+//     are OutOfRange (deviation from TE-011's `-0` sub-case, which conflicts
+//     with spec 3.2's "outside 0..8" wording).
+// ---------------------------------------------------------------------------
+
+// Status of one mini-board. `line` is the winning triple of cell indices
+// (0..8) inside that mini-board, for UI-5.3 / UI-5.7.
+pub type MiniStatus =
+  | MiniOpen
+  | MiniWon({ winner: Cell, line: Array<number> })
+  | MiniDrawn
+
+// Status of the whole game. `line` is the winning triple of MINI-BOARD
+// indices (0..8); it is the empty array for a tiebreak win (spec 4.6).
+pub type UOutcome =
+  | Playing
+  | Drawn
+  | Won({ winner: Cell, line: Array<number> })
+
+// A move: which mini-board, which cell inside it.
+pub type Move = { board: number, cell: number }
+
+// Why a move was refused (FR-3.4).
+pub type MoveError =
+  | GameOver
+  | OutOfRange({ board: number, cell: number })
+  | WrongBoard({ required: number, got: number })
+  | BoardClosed({ board: number })
+  | CellTaken({ board: number, cell: number })
+
+// The whole game state (spec 2.2).
+pub type UState = {
+  // 81 cells, cells[b * 9 + i]. Reuses xox.Cell (Empty | X | O).
+  cells: Array<Cell>,
+  // 9 entries, derived from `cells`, cached. boards[b] is b's status.
+  boards: Array<MiniStatus>,
+  // The mini-board the side to move MUST play in. None = free move.
+  forced: Option<number>,
+  // Whose turn it is: X or O, never Empty.
+  turn: Cell,
+  // Every move played, oldest first (FR-3.5).
+  history: Array<Move>,
+}
+
+// ---------------------------------------------------------------------------
+// Fixture library (test-matrix 2.1 / 2.2 / 2.3)
+// ---------------------------------------------------------------------------
+
+// EMPTY
+const p_empty: string = "........."
+
+// WX012 - MiniWon(X, [0,1,2]), 3/3
+const p_wx012: string = "XXXOO.O.."
+
+// WO012 - MiniWon(O, [0,1,2]), 3/3
+const p_wo012: string = "OOOXX.X.."
+
+// WX012L - MiniWon(X, [0,1,2]), 3/2, four empty cells
+const p_wx012l: string = "XXXOO...."
+
+// D1 - MiniDrawn, 5/4
+const p_d1: string = "XXOOOXXOX"
+
+// D2 - MiniDrawn, 4/5
+const p_d2: string = "OOXXXOOXO"
+
+// L1 - MiniOpen with ONE empty cell (2); X@2 wins, O@2 draws
+const p_l1: string = "XX.OOXXOO"
+
+// SP_OPEN - cell 0 empty; X@0 leaves the board open
+const p_sp_open: string = ".O.X....."
+
+// SP_WIN - cell 0 empty; X@0 wins [0,1,2]
+const p_sp_win: string = ".XXOO...."
+
+// SP_DRAW - cell 0 empty; X@0 fills it with no line
+const p_sp_draw: string = ".XOOXXXOO"
+
+// DIAG - cell 4 empty; X@4 wins [0,4,8]
+const p_diag: string = "XOO.....X"
+
+// THREAT8 - X@8 wins [2,5,8]
+const p_threat8: string = "..X.OX..."
+
+// B6 - the AC-35 trap board, empties {0,2,6,8}
+const p_b6: string = ".X.OXO.O."
+
+// ONEX - parity filler
+const p_onex: string = "X........"
+
+// Synthetic: holds a line for BOTH marks (E-17 / TE-072)
+const p_bothmini: string = "XXXOOO..."
+
+// G-CHAIN5: (4,4) (4,0) (0,8) (8,2) (2,6)
+const g_chain5_text: string = "U1|X|4440088226"
+
+// G-20: twenty legal moves, no board closed
+const g_20_text: string = "U1|X|0112233445566778800224466881133557700336"
+
+// G-CLOSED: X owns board 4 after six moves; turn X, free move
+const g_closed_text: string = "U1|X|400441144224"
+
+// G-XWIN: move 17 closes board 8 AND completes meta line [0,4,8]
+const g_xwin_text: string = "U1|X|0440088000144224466444388228855888"
+
+fn grid(groups: Array<string>) -> string {
+  return string.join(groups, "/")
+}
+
+fn fx(groups: Array<string>, f: Option<number>, t: Cell) -> UState {
+  return state_from_text(grid(groups), f, t)
+}
+
+fn fx_new() -> UState {
+  return new_game(X)
+}
+
+fn fx_wonfree() -> UState {
+  return fx(
+    [p_empty, p_empty, p_empty, p_wx012l, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    O,
+  )
+}
+
+fn fx_drawfree() -> UState {
+  return fx(
+    [p_empty, p_empty, p_empty, p_d1, p_empty, p_wx012, p_empty, p_empty, p_empty],
+    Some(0),
+    O,
+  )
+}
+
+fn fx_termforced() -> UState {
+  return fx(
+    [p_wx012, p_wx012, ".X.O.O.X.", p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(2),
+    X,
+  )
+}
+
+fn fx_tie43() -> UState {
+  return fx([p_wx012, p_wx012, p_wo012, p_d1, p_wo012, p_wx012, p_wx012, p_wo012, p_d2], None, X)
+}
+
+fn fx_tieeq() -> UState {
+  return fx([p_wx012, p_wx012, p_wo012, p_d1, p_wo012, p_wx012, p_d2, p_wo012, p_d1], None, O)
+}
+
+fn fx_alldrawn() -> UState {
+  return fx([p_d1, p_d2, p_d1, p_d2, p_d1, p_d2, p_d1, p_d2, p_d1], None, O)
+}
+
+fn fx_linebeats() -> UState {
+  return fx([p_wo012, p_wo012, p_wo012, p_wx012, p_d1, p_wx012, p_wx012, p_wx012, p_d2], None, X)
+}
+
+fn fx_bothlines() -> UState {
+  return fx(
+    [p_wx012, p_wx012, p_wx012, p_wo012, p_wo012, p_wo012, p_empty, p_empty, p_empty],
+    None,
+    O,
+  )
+}
+
+fn fx_mustblock() -> UState {
+  return fx([p_wx012, p_d1, p_d2, p_d1, p_wx012, p_d2, p_b6, p_d1, p_threat8], Some(6), O)
+}
+
+fn fx_winlast() -> UState {
+  return fx(
+    [p_l1, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    X,
+  )
+}
+
+fn fx_drawlast() -> UState {
+  return fx(
+    [p_l1, p_onex, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    O,
+  )
+}
+
+fn fx_sp_open() -> UState {
+  return fx(
+    [p_sp_open, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    X,
+  )
+}
+
+fn fx_sp_win() -> UState {
+  return fx(
+    [p_sp_win, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    X,
+  )
+}
+
+fn fx_sp_draw() -> UState {
+  return fx(
+    [p_sp_draw, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    X,
+  )
+}
+
+fn fx_diag() -> UState {
+  return fx(
+    [p_diag, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(0),
+    X,
+  )
+}
+
+fn fx_closedforced() -> UState {
+  return fx(
+    [p_empty, p_empty, p_empty, p_wx012, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(3),
+    X,
+  )
+}
+
+fn fx_badforced_high() -> UState {
+  return fx(
+    [p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(12),
+    X,
+  )
+}
+
+fn fx_badforced_low() -> UState {
+  return fx(
+    [p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    Some(-1),
+    X,
+  )
+}
+
+fn fx_bothmini() -> UState {
+  return fx(
+    [p_bothmini, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty, p_empty],
+    None,
+    X,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers. All pure, all real logic: they are the glue that turns a
+// matrix row into a one-line `@example`. None of them is a stub.
+// ---------------------------------------------------------------------------
+
+fn mv(b: number, c: number) -> Move {
+  let m: Move = { board: b, cell: c }
+  return m
+}
+
+fn yn(b: bool) -> string {
+  return match b {
+    true => "true",
+    false => "false",
+  }
+}
+
+fn nan_value() -> number {
+  return 0 / 0
+}
+
+fn inf_value() -> number {
+  return 1 / 0
+}
+
+// An obviously invalid state: every cell taken, every board claimed by
+// nobody, a forced board that cannot be, and no side to move. `after` and
+// `decoded` fall back to it so a rejected or failed step can never
+// masquerade as a correct one. The history it carries makes two failed steps
+// distinguishable from each other.
+fn wrong_state(hist: Array<Move>) -> UState {
+  let cells = array.map(array.range(81), fn(_i: number) -> Cell { X })
+  let boards = array.map(
+    array.range(9),
+    fn(_i: number) -> MiniStatus { MiniWon({ winner: Empty, line: [] }) },
+  )
+  let s: UState = { cells: cells, boards: boards, forced: Some(7), turn: Empty, history: hist }
+  return s
+}
+
+fn broken() -> UState {
+  return wrong_state([mv(7, 7), mv(7, 7)])
+}
+
+fn nums_text(ns: Array<number>) -> string {
+  let parts = array.map(ns, fn(n: number) -> string { number.to_string(n) })
+  return string.join(parts, ",")
+}
+
+fn move_text(m: Move) -> string {
+  return "${m.board}${m.cell}"
+}
+
+fn moves_text(ms: Array<Move>) -> string {
+  let parts = array.map(ms, fn(m: Move) -> string { move_text(m) })
+  return string.join(parts, ",")
+}
+
+fn history_text(s: UState) -> string {
+  return moves_text(s.history)
+}
+
+fn forced_text(s: UState) -> string {
+  return match s.forced {
+    Some(b) => number.to_string(b),
+    None => "-",
+  }
+}
+
+fn status_char(st: MiniStatus) -> string {
+  return match st {
+    MiniOpen => "o",
+    MiniDrawn => "d",
+    MiniWon(w) => xox.mark(w.winner),
+  }
+}
+
+fn status_text(st: MiniStatus) -> string {
+  return match st {
+    MiniOpen => "open",
+    MiniDrawn => "drawn",
+    MiniWon(w) => "${xox.mark(w.winner)} won [${nums_text(w.line)}]",
+  }
+}
+
+fn boards_text(s: UState) -> string {
+  let parts = array.map(s.boards, fn(st: MiniStatus) -> string { status_char(st) })
+  return string.join(parts, "")
+}
+
+// The cached status of board `b`, read straight out of the record (I-2).
+fn board_of(s: UState, b: number) -> MiniStatus {
+  return s.boards[b]
+}
+
+fn outcome_text(s: UState) -> string {
+  return match outcome(s) {
+    Playing => "playing",
+    Drawn => "drawn",
+    Won(w) => "${xox.mark(w.winner)} wins [${nums_text(w.line)}]",
+  }
+}
+
+fn winner_text(s: UState) -> string {
+  return match winner(s) {
+    Some(c) => xox.mark(c),
+    None => "-",
+  }
+}
+
+// outcome + is_terminal + legal-move count in one assertion (I-7).
+fn term_text(s: UState) -> string {
+  let n = array.len(legal_moves(s))
+  return "${outcome_text(s)} ${yn(is_terminal(s))} ${n}"
+}
+
+fn error_text(e: MoveError) -> string {
+  return match e {
+    GameOver => "GameOver",
+    OutOfRange(p) => "OutOfRange(${p.board},${p.cell})",
+    WrongBoard(p) => "WrongBoard(${p.required},${p.got})",
+    BoardClosed(p) => "BoardClosed(${p.board})",
+    CellTaken(p) => "CellTaken(${p.board},${p.cell})",
+  }
+}
+
+fn err_text(r: Result<UState, MoveError>) -> string {
+  return match r {
+    Ok(_s) => "ok",
+    Err(e) => error_text(e),
+  }
+}
+
+fn move_err(s: UState, m: Move) -> string {
+  return err_text(apply_move(s, m))
+}
+
+// Applies `m`, or yields an obviously wrong state when the engine rejects it.
+fn after(s: UState, m: Move) -> UState {
+  return match apply_move(s, m) {
+    Ok(next) => next,
+    Err(_e) => wrong_state([m]),
+  }
+}
+
+fn after_seq(s: UState, ms: Array<Move>) -> UState {
+  return array.fold(ms, s, fn(acc: UState, m: Move) -> UState { after(acc, m) })
+}
+
+fn snapshot(s: UState) -> string {
+  return "${state_to_text(s)} f=${forced_text(s)} t=${xox.mark(s.turn)} h=${history_text(s)}"
+}
+
+fn decoded(text: string) -> UState {
+  return match decode(text) {
+    Ok(s) => s,
+    Err(_e) => broken(),
+  }
+}
+
+fn decode_text(text: string) -> string {
+  return match decode(text) {
+    Ok(s) => "ok:${array.len(s.history)}",
+    Err(_e) => "err",
+  }
+}
+
+fn digit_at(text: string, i: number) -> number {
+  let ch = string.slice(text, i, i + 1)
+  return match number.parse(ch) {
+    Ok(n) => n,
+    Err(_e) => -1,
+  }
+}
+
+fn first_of(text: string) -> Cell {
+  return xox.cell_from(string.slice(text, 3, 4))
+}
+
+fn moves_of(text: string) -> Array<Move> {
+  let digits = string.slice(text, 5)
+  let count = string.len(digits) / 2
+  return array.map(
+    array.range(count),
+    fn(k: number) -> Move { mv(digit_at(digits, k * 2), digit_at(digits, k * 2 + 1)) },
+  )
+}
+
+// Every state from the opening to the last ply, oldest first.
+fn state_trace(first: Cell, ms: Array<Move>) -> Array<UState> {
+  let start: Array<UState> = [new_game(first)]
+  return array.fold(
+    ms,
+    start,
+    fn(acc: Array<UState>, m: Move) -> Array<UState> {
+      let last = acc[array.len(acc) - 1]
+      return array.push(acc, after(last, m))
+    },
+  )
+}
+
+fn replay_trace(text: string) -> Array<UState> {
+  return state_trace(first_of(text), moves_of(text))
+}
+
+fn state_at(text: string, plies: number) -> UState {
+  let states = state_trace(first_of(text), array.slice(moves_of(text), 0, plies))
+  return states[array.len(states) - 1]
+}
+
+fn g_20() -> UState {
+  return decoded(g_20_text)
+}
+
+fn g_closed() -> UState {
+  return decoded(g_closed_text)
+}
+
+fn g_xwin() -> UState {
+  return decoded(g_xwin_text)
+}
+
+fn prefix_at(text: string, plies: number) -> string {
+  return string.slice(text, 0, 5 + plies * 2)
+}
+
+fn forced_trace(text: string) -> string {
+  let tail = array.slice(replay_trace(text), 1)
+  let parts = array.map(tail, fn(s: UState) -> string { forced_text(s) })
+  return string.join(parts, ",")
+}
+
+// forced value and legal-move count after each ply of a forced chain.
+fn chain_probe(text: string) -> string {
+  let tail = array.slice(replay_trace(text), 1)
+  let parts = array.map(
+    tail,
+    fn(s: UState) -> string {
+      let n = array.len(legal_moves(s))
+      return "${forced_text(s)}:${n}"
+    },
+  )
+  return string.join(parts, ",")
+}
+
+// The cached mini-board statuses at every ply (I-2, TE-078).
+fn boards_trace(text: string) -> string {
+  let parts = array.map(replay_trace(text), fn(s: UState) -> string { boards_text(s) })
+  return string.join(parts, ",")
+}
+
+fn count_in_board(ms: Array<Move>, b: number) -> number {
+  return array.len(array.filter(ms, fn(m: Move) -> bool { m.board == b }))
+}
+
+fn boards_of(ms: Array<Move>) -> string {
+  let bs = array.filter(array.range(9), fn(b: number) -> bool { count_in_board(ms, b) > 0 })
+  return nums_text(bs)
+}
+
+fn ascending(ms: Array<Move>) -> bool {
+  let keys = array.map(ms, fn(m: Move) -> number { m.board * 9 + m.cell })
+  let bad = array.filter(
+    array.range(array.len(keys)),
+    fn(i: number) -> bool {
+      let broke = match i == 0 {
+        true => false,
+        false => keys[i] <= keys[i - 1],
+      }
+      return broke
+    },
+  )
+  return array.len(bad) == 0
+}
+
+fn ends_text(ms: Array<Move>) -> string {
+  let n = array.len(ms)
+  return match n == 0 {
+    true => "-",
+    false => "${move_text(ms[0])} ${move_text(ms[n - 1])}",
+  }
+}
+
+fn filled_cells(s: UState) -> number {
+  return array.len(array.filter(s.cells, fn(c: Cell) -> bool { !xox.is_empty(c) }))
+}
+
+// boards won by X, by O, and drawn (AC-19).
+fn tally_text(s: UState) -> string {
+  let drawn = array.len(
+    array.filter(s.boards, fn(st: MiniStatus) -> bool { status_char(st) == "d" }),
+  )
+  return "${boards_won(s, X)},${boards_won(s, O)},${drawn}"
+}
+
+// history length vs filled cells (I-5).
+fn fill_probe(s: UState) -> string {
+  return "${array.len(s.history)} ${filled_cells(s)}"
+}
+
+// A rejected move must leave the input untouched (AC-9).
+fn reject_probe(s: UState, m: Move) -> string {
+  let before = snapshot(s)
+  let before_boards = boards_text(s)
+  let r = apply_move(s, m)
+  let same = snapshot(s) == before && boards_text(s) == before_boards
+  return "${err_text(r)} ${yn(same)} ${string.len(state_to_text(s))}"
+}
+
+// apply_move returns a NEW record and grows history by exactly one (AC-13).
+fn apply_probe(text: string, plies: number) -> string {
+  let before = state_at(text, plies)
+  let all = moves_of(text)
+  let m = all[plies]
+  let snap = snapshot(before)
+  let before_boards = boards_text(before)
+  let next = after(before, m)
+  let untouched = snapshot(before) == snap && boards_text(before) == before_boards
+  return "${yn(untouched)} ${array.len(before.history)} ${array.len(next.history)} ${boards_text(next)}"
+}
+
+fn undo_text(s: UState) -> string {
+  return match undo(s) {
+    Some(p) => snapshot(p),
+    None => "none",
+  }
+}
+
+// How many plies of a replay undo back to their predecessor (AC-11).
+fn undo_chain_ok(text: string) -> number {
+  let states = replay_trace(text)
+  let ks = array.range_from(1, array.len(states))
+  let good = array.filter(
+    ks,
+    fn(k: number) -> bool { undo_text(states[k]) == snapshot(states[k - 1]) },
+  )
+  return array.len(good)
+}
+
+// A rejection must not corrupt history: undo still yields the previous ply.
+fn reject_then_undo_text() -> string {
+  let s = g_20()
+  let _r = apply_move(s, mv(9, 9))
+  let prev = state_at(g_20_text, 19)
+  let got = undo_text(s)
+  return match got == snapshot(prev) {
+    true => "match",
+    false => "differ",
+  }
+}
+
+// decode(encode(s)) == s (AC-12).
+fn recode_text(text: string) -> string {
+  let s = decoded(text)
+  let again = decoded(encode(s))
+  return yn(snapshot(s) == snapshot(again))
+}
+
+fn encode_of(text: string) -> string {
+  return encode(decoded(text))
+}
+
+// The same position built by replay and by state_from_text behaves
+// identically (AC-24, and the I-6 proof: they differ only in history).
+fn twin_probe(text: string) -> string {
+  let s = decoded(text)
+  let twin = state_from_text(state_to_text(s), s.forced, s.turn)
+  let a = yn(moves_text(legal_moves(s)) == moves_text(legal_moves(twin)))
+  let b = yn(outcome_text(s) == outcome_text(twin))
+  let c = yn(is_terminal(s) == is_terminal(twin))
+  let d = yn(forced_text(s) == forced_text(twin))
+  return "${a} ${b} ${c} ${d} ${array.len(legal_moves(s))}"
+}
+
+// Round-trips the grid form and reports its length (89 = 81 cells + 8 `/`).
+fn grid_round_trip(s: UState) -> string {
+  let t = state_to_text(s)
+  let back = state_from_text(t, s.forced, s.turn)
+  return "${yn(state_to_text(back) == t)} ${string.len(t)}"
+}
+
+// render must produce something and must not disturb the grid (TE-083).
+fn render_probe(s: UState) -> string {
+  return "${yn(string.len(render(s)) > 0)} ${grid_round_trip(s)}"
+}
+
+// replay(first_player(s), s.history) reproduces s (TE-082).
+fn replay_probe(text: string) -> string {
+  let s = decoded(text)
+  return match replay(first_player(s), s.history) {
+    Ok(r) => yn(snapshot(r) == snapshot(s)),
+    Err(_e) => "err",
+  }
+}
+
+// search_root drops history and changes nothing else (D-U5).
+fn search_root_probe(text: string) -> string {
+  let s = decoded(text)
+  let r = search_root(s)
+  let same = state_to_text(r) == state_to_text(s)
+    && forced_text(r) == forced_text(s)
+    && xox.same(r.turn, s.turn)
+  return "${array.len(r.history)} ${yn(same)}"
+}
+
+fn long_save() -> string {
+  let pairs = string.repeat("44", 82)
+  return "U1|X|${pairs}"
+}
+
+// Every fixture plus every ply of G-XWIN and G-20.
+fn all_positions() -> Array<UState> {
+  let fixtures: Array<UState> = [
+    fx_new(),
+    fx_wonfree(),
+    fx_drawfree(),
+    fx_termforced(),
+    fx_tie43(),
+    fx_tieeq(),
+    fx_alldrawn(),
+    fx_linebeats(),
+    fx_bothlines(),
+    fx_mustblock(),
+    fx_winlast(),
+    fx_drawlast(),
+    fx_sp_open(),
+    fx_sp_win(),
+    fx_sp_draw(),
+    fx_diag(),
+    fx_closedforced(),
+    fx_badforced_high(),
+    fx_badforced_low(),
+  ]
+  let plies = array.concat(replay_trace(g_xwin_text), replay_trace(g_20_text))
+  return array.concat(fixtures, plies)
+}
+
+// I-7: is_terminal(s) == (legal_moves(s) == []), everywhere, and at least one
+// position really is terminal (so the check cannot pass vacuously).
+fn i7_probe() -> string {
+  let ps = all_positions()
+  let bad = array.filter(
+    ps,
+    fn(s: UState) -> bool { is_terminal(s) != (array.len(legal_moves(s)) == 0) },
+  )
+  let term = array.filter(ps, fn(s: UState) -> bool { is_terminal(s) })
+  return "${array.len(bad)} ${yn(array.len(term) > 0)}"
+}
+
+// I-1 and I-3: 81 cells, 9 boards, turn is never Empty.
+fn shape_probe() -> string {
+  let ps = all_positions()
+  let bad_cells = array.filter(ps, fn(s: UState) -> bool { array.len(s.cells) != 81 })
+  let bad_boards = array.filter(ps, fn(s: UState) -> bool { array.len(s.boards) != 9 })
+  let bad_turn = array.filter(ps, fn(s: UState) -> bool { xox.is_empty(s.turn) })
+  return "${array.len(bad_cells)} ${array.len(bad_boards)} ${array.len(bad_turn)}"
+}
+
+// ---------------------------------------------------------------------------
+// Engine internals. Pure, allocation-based, no `mut` anywhere (spec 1.3).
+// ---------------------------------------------------------------------------
+
+// The nine cells of mini-board `b`, ascending by cell index (spec 2.1).
+fn sub_board(cells: Array<Cell>, b: number) -> Array<Cell> {
+  return array.map(array.range(9), fn(i: number) -> Cell { cells[b * 9 + i] })
+}
+
+// The mark holding `line` inside one mini-board, or Empty when it is not
+// complete. Mirrors xox's own line test so the two engines cannot disagree.
+fn line_mark(mini: Array<Cell>, line: Array<number>) -> Cell {
+  let a = mini[line[0]]
+  let b = mini[line[1]]
+  let c = mini[line[2]]
+  let held = !xox.is_empty(a) && xox.same(a, b) && xox.same(a, c)
+  return match held {
+    true => a,
+    false => Empty,
+  }
+}
+
+// R-4: the win test runs BEFORE the fullness test, so a move that fills the
+// last empty cell and completes a line is MiniWon, never MiniDrawn. When two
+// marks both hold a line (only reachable via state_from_text, E-17) the first
+// line in xox.win_lines order wins, exactly as xox.outcome resolves it.
+fn status_from(mini: Array<Cell>) -> MiniStatus {
+  let wins = array.filter(
+    xox.win_lines,
+    fn(line: Array<number>) -> bool { !xox.is_empty(line_mark(mini, line)) },
+  )
+  let empties = array.filter(mini, fn(c: Cell) -> bool { xox.is_empty(c) })
+  let unfinished = match array.len(empties) == 0 {
+    true => MiniDrawn,
+    false => MiniOpen,
+  }
+  return match array.len(wins) > 0 {
+    true => MiniWon({ winner: line_mark(mini, wins[0]), line: wins[0] }),
+    false => unfinished,
+  }
+}
+
+// Every mini-board's status, derived from the 81 cells (I-2).
+fn statuses_from(cells: Array<Cell>) -> Array<MiniStatus> {
+  return array.map(array.range(9), fn(b: number) -> MiniStatus { status_from(sub_board(cells, b)) })
+}
+
+// A coordinate is usable only when it is a whole number in 0..8. NaN and
+// Infinity fail the comparisons, 4.5 fails the integrality test, and `-0` is
+// the number 0 and therefore in range.
+fn in_range(n: number) -> bool {
+  return n >= 0 && n <= 8 && n % 1 == 0
+}
+
+// The mark that claimed meta cell `b`. A drawn board claims nothing (R-6).
+fn claim_of(s: UState, b: number) -> Cell {
+  return match s.boards[b] {
+    MiniOpen => Empty,
+    MiniDrawn => Empty,
+    MiniWon(w) => w.winner,
+  }
+}
+
+// The mark holding a meta line, or Empty.
+fn meta_mark(s: UState, line: Array<number>) -> Cell {
+  let a = claim_of(s, line[0])
+  let b = claim_of(s, line[1])
+  let c = claim_of(s, line[2])
+  let held = !xox.is_empty(a) && xox.same(a, b) && xox.same(a, c)
+  return match held {
+    true => a,
+    false => Empty,
+  }
+}
+
+// One digit, or -1 for anything that is not one. number.parse is not usable
+// here: it reads "" and " " as 0.
+fn digit_of(ch: string) -> number {
+  return match ch {
+    "0" => 0,
+    "1" => 1,
+    "2" => 2,
+    "3" => 3,
+    "4" => 4,
+    "5" => 5,
+    "6" => 6,
+    "7" => 7,
+    "8" => 8,
+    "9" => 9,
+    else => -1,
+  }
+}
+
+// The successful half of apply_move, reached only after all five checks pass.
+// Three small allocations and ~91 + n pointer copies, no deep copy (spec 2.4).
+fn commit(s: UState, m: Move) -> UState {
+  let idx = m.board * 9 + m.cell
+  let cells = array.map(
+    array.range(81),
+    fn(i: number) -> Cell {
+      let c = match i == idx {
+        true => s.turn,
+        false => s.cells[i],
+      }
+      return c
+    },
+  )
+  // Only the touched board's status can have changed.
+  let touched = status_from(sub_board(cells, m.board))
+  let boards = array.map(
+    array.range(9),
+    fn(b: number) -> MiniStatus {
+      let st = match b == m.board {
+        true => touched,
+        false => s.boards[b],
+      }
+      return st
+    },
+  )
+  // D-U3 / I-4: `forced` is normalised on write, and the status consulted is
+  // the POST-move one, which is what decides a move at (b, b) (E-6).
+  let points_at_open = match boards[m.cell] {
+    MiniOpen => true,
+    MiniDrawn => false,
+    MiniWon(_w) => false,
+  }
+  let next_forced: Option<number> = match points_at_open {
+    true => Some(m.cell),
+    false => None,
+  }
+  let next: UState = {
+    cells: cells,
+    boards: boards,
+    forced: next_forced,
+    turn: xox.other(s.turn),
+    history: array.push(s.history, m),
+  }
+  return next
+}
+
+// Checks 2..5 of spec 3.2, one function per check so that each is evaluated
+// only once its predecessor has passed.
+fn check_range(s: UState, m: Move) -> Result<UState, MoveError> {
+  return match in_range(m.board) && in_range(m.cell) {
+    true => check_forced(s, m),
+    false => Err(OutOfRange({ board: m.board, cell: m.cell })),
+  }
+}
+
+fn check_forced(s: UState, m: Move) -> Result<UState, MoveError> {
+  return match s.forced {
+    Some(b) => check_required(s, m, b),
+    None => check_open(s, m),
+  }
+}
+
+fn check_required(s: UState, m: Move, required: number) -> Result<UState, MoveError> {
+  return match required == m.board {
+    true => check_open(s, m),
+    false => Err(WrongBoard({ required: required, got: m.board })),
+  }
+}
+
+fn check_open(s: UState, m: Move) -> Result<UState, MoveError> {
+  return match is_open(s, m.board) {
+    true => check_cell(s, m),
+    false => Err(BoardClosed({ board: m.board })),
+  }
+}
+
+fn check_cell(s: UState, m: Move) -> Result<UState, MoveError> {
+  return match xox.is_empty(s.cells[m.board * 9 + m.cell]) {
+    true => Ok(commit(s, m)),
+    false => Err(CellTaken({ board: m.board, cell: m.cell })),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The engine.
+// ---------------------------------------------------------------------------
+
+// TE-002 [AC-2] a new game is empty, free, X to move, Playing
+@example forced_text(new_game(X)) == "-"
+@example xox.mark(new_game(X).turn) == "X"
+@example array.len(new_game(X).history) == 0
+@example outcome_text(new_game(X)) == "playing"
+@example boards_text(new_game(X)) == "ooooooooo"
+@example filled_cells(new_game(X)) == 0
+@example xox.mark(new_game(O).turn) == "O"
+// 81 empty cells, 9 open boards, a free first move, `first` to play (R-8, R-9).
+pub fn new_game(first: Cell) -> UState {
+  let cells = array.map(array.range(81), fn(_i: number) -> Cell { Empty })
+  let boards = array.map(array.range(9), fn(_i: number) -> MiniStatus { MiniOpen })
+  let s: UState = { cells: cells, boards: boards, forced: None, turn: first, history: [] }
+  return s
+}
+
+// TE-001 [AC-1] 81 legal moves on an empty board
+@example array.len(legal_moves(fx_new())) == 81
+// TE-005 [AC-3] after (4,0) the nine cells of board 0, ascending
+@example moves_text(legal_moves(after(fx_new(), mv(4, 0)))) == "00,01,02,03,04,05,06,07,08"
+// TE-048 [AC-28] after (4,4) the eight remaining cells of board 4
+@example moves_text(legal_moves(after_seq(fx_new(), [mv(4, 4)]))) == "40,41,42,43,45,46,47,48"
+// TE-027 [AC-16] forced target won -> free move over every OPEN board (71)
+@example array.len(legal_moves(after(fx_wonfree(), mv(0, 3)))) == 71
+@example count_in_board(legal_moves(after(fx_wonfree(), mv(0, 3))), 3) == 0
+// TE-052 / TE-035 [AC-30, AC-21] forced target drawn -> 62 moves, none in 3 or 5
+@example array.len(legal_moves(after(fx_drawfree(), mv(0, 3)))) == 62
+@example boards_of(legal_moves(after(fx_drawfree(), mv(0, 3)))) == "0,1,2,4,6,7,8"
+@example count_in_board(legal_moves(after(fx_drawfree(), mv(0, 3))), 0) == 8
+@example count_in_board(legal_moves(after(fx_drawfree(), mv(0, 3))), 3) == 0
+@example count_in_board(legal_moves(after(fx_drawfree(), mv(0, 3))), 5) == 0
+// TE-039 [AC-24] the order is normative: strictly ascending by board then cell
+@example ascending(legal_moves(after(fx_drawfree(), mv(0, 3)))) == true
+@example ends_text(legal_moves(after(fx_drawfree(), mv(0, 3)))) == "00 88"
+// TE-074 [AC-2] a fixture may not force a CLOSED board: 72 moves, forced None
+@example array.len(legal_moves(fx_closedforced())) == 72
+// TE-073 [AC-2] nor an out-of-range one
+@example array.len(legal_moves(fx_badforced_high())) == 81
+@example array.len(legal_moves(fx_badforced_low())) == 81
+// TE-066 [ADV, AC-20/24] terminal wins over forced: no moves although board 4 is open
+@example array.len(legal_moves(after(fx_termforced(), mv(2, 4)))) == 0
+// Every empty cell of every playable board, ascending by board then cell. The
+// order is normative (spec 3.1); `playable_boards` already returns [] on a
+// terminal state, which is what makes I-7 hold.
+pub fn legal_moves(s: UState) -> Array<Move> {
+  return array.flat_map(
+    playable_boards(s),
+    fn(b: number) -> Array<Move> {
+      let empties = array.filter(
+        array.range(9),
+        fn(i: number) -> bool { xox.is_empty(s.cells[b * 9 + i]) },
+      )
+      return array.map(empties, fn(i: number) -> Move { mv(b, i) })
+    },
+  )
+}
+
+// TE-004 [AC-3] a legal move is accepted and points at board 0
+@example move_err(fx_new(), mv(4, 0)) == "ok"
+@example forced_text(after(fx_new(), mv(4, 0))) == "0"
+// TE-006 [AC-4] wrong board while forced
+@example move_err(after(fx_new(), mv(4, 0)), mv(3, 1)) == "WrongBoard(0,3)"
+// TE-007 [AC-5] occupied cell in an allowed board
+@example move_err(g_closed(), mv(0, 4)) == "CellTaken(0,4)"
+// TE-008 [AC-6] out-of-range coordinates echo the offending pair
+@example move_err(fx_new(), mv(9, 0)) == "OutOfRange(9,0)"
+@example move_err(fx_new(), mv(0, 9)) == "OutOfRange(0,9)"
+@example move_err(fx_new(), mv(-1, 0)) == "OutOfRange(-1,0)"
+@example move_err(fx_new(), mv(0, -1)) == "OutOfRange(0,-1)"
+// TE-009 [AC-6] range check precedes the forced-board check
+@example move_err(after(fx_new(), mv(4, 0)), mv(9, 0)) == "OutOfRange(9,0)"
+// TE-010 [ADV] non-integer coordinates are out of range even though 4.5 < 9
+@example move_err(fx_new(), mv(4.5, 0)) == "OutOfRange(4.5,0)"
+@example move_err(fx_new(), mv(0, 4.5)) == "OutOfRange(0,4.5)"
+// TE-011 [ADV] NaN and Infinity: NaN < 0 and NaN > 8 are both false
+@example move_err(fx_new(), mv(nan_value(), 0)) == "OutOfRange(NaN,0)"
+@example move_err(fx_new(), mv(0, nan_value())) == "OutOfRange(0,NaN)"
+@example move_err(fx_new(), mv(inf_value(), 0)) == "OutOfRange(Infinity,0)"
+@example move_err(fx_new(), mv(0, inf_value())) == "OutOfRange(0,Infinity)"
+// TE-011 [ADV] -0 IS 0, so it is in range and accepted (documented deviation)
+@example move_err(fx_new(), mv(-0, 0)) == "ok"
+// TE-012 [AC-7] free move into a WON board
+@example move_err(g_closed(), mv(4, 3)) == "BoardClosed(4)"
+// TE-013 [AC-7] free move into a DRAWN board
+@example move_err(after(fx_drawfree(), mv(0, 3)), mv(3, 0)) == "BoardClosed(3)"
+// TE-014 / TE-046 [AC-8] an otherwise legal move on a terminal state
+@example move_err(g_xwin(), mv(1, 0)) == "GameOver"
+// TE-015 [ADV] GameOver dominates OutOfRange
+@example move_err(g_xwin(), mv(9, 0)) == "GameOver"
+// TE-068 [ADV] WrongBoard precedes BoardClosed
+@example move_err(state_at(g_closed_text, 5), mv(4, 3)) == "WrongBoard(2,4)"
+// TE-069 [ADV] BoardClosed precedes CellTaken
+@example move_err(g_closed(), mv(4, 0)) == "BoardClosed(4)"
+// The five checks of spec 3.2, in order: GameOver, OutOfRange, WrongBoard,
+// BoardClosed, CellTaken. The first failure is returned and `s` is never
+// touched - there is no `mut` in this module (FR-3.4).
+pub fn apply_move(s: UState, m: Move) -> Result<UState, MoveError> {
+  return match is_terminal(s) {
+    true => Err(GameOver),
+    false => check_range(s, m),
+  }
+}
+
+// TE-016 [AC-9] a rejected move leaves the input state completely untouched,
+// once per rejection kind. "89" is the length of the /-separated grid form.
+@example reject_probe(after(fx_new(), mv(4, 0)), mv(3, 1)) == "WrongBoard(0,3) true 89"
+@example reject_probe(g_closed(), mv(0, 4)) == "CellTaken(0,4) true 89"
+@example reject_probe(fx_new(), mv(9, 0)) == "OutOfRange(9,0) true 89"
+@example reject_probe(g_closed(), mv(4, 3)) == "BoardClosed(4) true 89"
+@example reject_probe(g_xwin(), mv(1, 0)) == "GameOver true 89"
+// The `/`-separated 9x9 grid form: nine groups of nine marks, 89 characters.
+// Fixtures and debugging only - the persistence form is `encode` (D-U7).
+pub fn state_to_text(s: UState) -> string {
+  let groups = array.map(
+    array.range(9),
+    fn(b: number) -> string {
+      let marks = array.map(
+        array.range(9),
+        fn(i: number) -> string { xox.mark(s.cells[b * 9 + i]) },
+      )
+      return string.join(marks, "")
+    },
+  )
+  return string.join(groups, "/")
+}
+
+// TE-073 [ADV, AC-2] forced is normalised on write: out of range becomes None
+@example forced_text(fx_badforced_high()) == "-"
+@example forced_text(fx_badforced_low()) == "-"
+// TE-074 [ADV, AC-2] a closed board can never be the forced board (I-4)
+@example forced_text(fx_closedforced()) == "-"
+// TE-080 [ADV, G-1] a fixture state carries NO history: I-5 is replay-only
+@example fill_probe(fx_drawfree()) == "0 15"
+// The fixture builder. `/` separators are stripped, the string is padded and
+// truncated to 81 characters, anything that is not X/O is Empty. `boards` is
+// derived from the cells and `forced` is normalised (I-4), so a fixture cannot
+// express an impossible state. History is empty by construction (G-1).
+pub fn state_from_text(cells: string, forced: Option<number>, turn: Cell) -> UState {
+  let flat = string.replace_all(cells, "/", "")
+  let chars = string.split(flat, "")
+  let grid_cells = array.map(
+    array.range(81),
+    fn(i: number) -> Cell {
+      let ch = match i < array.len(chars) {
+        true => chars[i],
+        false => ".",
+      }
+      return xox.cell_from(ch)
+    },
+  )
+  let boards = statuses_from(grid_cells)
+  let base: UState = { cells: grid_cells, boards: boards, forced: None, turn: turn, history: [] }
+  let keep = match forced {
+    Some(b) => is_open(base, b),
+    None => false,
+  }
+  let normalised: Option<number> = match keep {
+    true => forced,
+    false => None,
+  }
+  let s: UState = { cells: grid_cells, boards: boards, forced: normalised, turn: turn, history: [] }
+  return s
+}
+
+// TE-034 [AC-20] three boards on a meta line end the game at once
+@example term_text(after(fx_termforced(), mv(2, 4))) == "X wins [0,1,2] true 0"
+// TE-036 [AC-22] full grid, no line, 4-3 on boards won
+@example outcome_text(fx_tie43()) == "X wins []"
+@example term_text(fx_tie43()) == "X wins [] true 0"
+// TE-037 [AC-23] full grid, no line, equal tallies
+@example outcome_text(fx_tieeq()) == "drawn"
+// TE-038 / TE-041 [AC-23, AC-25] nine drawn boards are a full grid
+@example term_text(fx_alldrawn()) == "drawn true 0"
+// TE-070 [ADV] the meta-line scan runs BEFORE the tiebreak
+@example outcome_text(fx_linebeats()) == "O wins [0,1,2]"
+// TE-071 [ADV] two meta lines: the first in win_lines order wins (totality)
+@example outcome_text(fx_bothlines()) == "X wins [0,1,2]"
+// TE-002 [AC-2] and a fresh game is Playing
+@example outcome_text(fx_new()) == "playing"
+@example outcome_text(fx_mustblock()) == "playing"
+// Computed from `boards` alone (spec 3.3): the meta-line scan first, then
+// "any board still open" -> Playing, then the tiebreak of spec 4.6.
+pub fn outcome(s: UState) -> UOutcome {
+  let lines = array.filter(
+    xox.win_lines,
+    fn(line: Array<number>) -> bool { !xox.is_empty(meta_mark(s, line)) },
+  )
+  let open_boards = array.filter(array.range(9), fn(b: number) -> bool { is_open(s, b) })
+  let x_count = boards_won(s, X)
+  let o_count = boards_won(s, O)
+  // D-U4: a win on count carries an empty `line`, which is how UI-5.7 tells it
+  // apart from a win on a line without needing another variant.
+  let no_line: Array<number> = []
+  let tiebreak = match x_count > o_count {
+    true => Won({ winner: X, line: no_line }),
+    false => match o_count > x_count {
+      true => Won({ winner: O, line: no_line }),
+      false => Drawn,
+    },
+  }
+  let unfinished = match array.len(open_boards) > 0 {
+    true => Playing,
+    false => tiebreak,
+  }
+  return match array.len(lines) > 0 {
+    true => Won({ winner: meta_mark(s, lines[0]), line: lines[0] }),
+    false => unfinished,
+  }
+}
+
+// TE-014 [AC-8] / FR-3.2 winner is the thin form of outcome
+@example winner_text(g_xwin()) == "X"
+@example winner_text(fx_tie43()) == "X"
+@example winner_text(fx_linebeats()) == "O"
+@example winner_text(fx_alldrawn()) == "-"
+@example winner_text(fx_new()) == "-"
+// The FR-3.2 contract: the thin form of `outcome`. It cannot tell a draw from
+// a game in progress, which is why the UI reads `outcome` and `is_terminal`.
+pub fn winner(s: UState) -> Option<Cell> {
+  return match outcome(s) {
+    Playing => None,
+    Drawn => None,
+    Won(w) => Some(w.winner),
+  }
+}
+
+// TE-077 [ADV, I-7] is_terminal agrees with legal_moves in every position
+@example i7_probe() == "0 true"
+// TE-079 [ADV, I-1/I-3] 81 cells, 9 boards, turn never Empty, everywhere
+@example shape_probe() == "0 0 0"
+// I-7: equivalent to "no legal moves". A meta win ends the game at once (R-7),
+// even with open boards left.
+pub fn is_terminal(s: UState) -> bool {
+  return match outcome(s) {
+    Playing => false,
+    Drawn => true,
+    Won(_w) => true,
+  }
+}
+
+// TE-041 / TE-042 [AC-25] "full" includes drawn boards; an unfinished game
+// and a position with legal replies are not terminal.
+@example terminal_probe() == "true true true false false"
+fn terminal_probe() -> string {
+  let a = yn(is_terminal(fx_alldrawn()))
+  let b = yn(is_terminal(fx_tie43()))
+  let c = yn(is_terminal(g_xwin()))
+  let d = yn(is_terminal(fx_new()))
+  let e = yn(is_terminal(fx_mustblock()))
+  return "${a} ${b} ${c} ${d} ${e}"
+}
+
+// A board is open iff its cached status is MiniOpen (R-3). Total: an index
+// that is not a board is never open, which is what lets `state_from_text`
+// normalise an out-of-range `forced` away.
+pub fn is_open(s: UState, b: number) -> bool {
+  let st = match in_range(b) {
+    true => s.boards[b],
+    false => MiniDrawn,
+  }
+  return match st {
+    MiniOpen => true,
+    MiniDrawn => false,
+    MiniWon(_w) => false,
+  }
+}
+
+// A board is open iff its cached status is MiniOpen: board 4 of G-CLOSED is
+// won, board 3 of FX-ALLDRAWN is drawn, the other two are open.
+@example open_probe() == "false true false true"
+fn open_probe() -> string {
+  let a = yn(is_open(g_closed(), 4))
+  let b = yn(is_open(g_closed(), 0))
+  let c = yn(is_open(fx_alldrawn(), 3))
+  let d = yn(is_open(fx_new(), 8))
+  return "${a} ${b} ${c} ${d}"
+}
+
+// TE-029 / TE-043 [AC-18, AC-26] win-on-last-cell: the move fills board 0's
+// last empty cell AND completes [0,1,2] -> MiniWon, never MiniDrawn
+@example status_text(board_of(after(fx_winlast(), mv(0, 2)), 0)) == "X won [0,1,2]"
+// TE-031 / TE-044 [AC-19, AC-26] the twin: same board, same cell, O plays it
+@example status_text(board_of(after(fx_drawlast(), mv(0, 2)), 0)) == "drawn"
+// TE-030 [AC-18] the win_lines scan reaches the diagonals
+@example status_text(board_of(after(fx_diag(), mv(0, 4)), 0)) == "X won [0,4,8]"
+// TE-045 [AC-27] the 17th move of G-XWIN closes board 8 by [2,5,8]
+@example status_text(board_of(after(state_at(g_xwin_text, 16), mv(8, 8)), 8)) == "X won [2,5,8]"
+// The accessor for the cached status (I-2): it reads `boards`, it never
+// recomputes, so a stale cache would show up here first.
+pub fn mini_status(s: UState, b: number) -> MiniStatus {
+  let st = match in_range(b) {
+    true => s.boards[b],
+    false => MiniDrawn,
+  }
+  return st
+}
+
+// TE-072 [ADV, E-17] a mini-board holding a line for both marks is total:
+// the first line in win_lines order wins. mini_status is the accessor for
+// the cached status, so it must agree with the boards array.
+@example mini_probe() == "X won [0,1,2] | drawn | open"
+fn mini_probe() -> string {
+  let a = status_text(mini_status(fx_bothmini(), 0))
+  let b = status_text(mini_status(fx_alldrawn(), 4))
+  let c = status_text(mini_status(fx_new(), 4))
+  return "${a} | ${b} | ${c}"
+}
+
+// The one indexing convention: cells[b * 9 + i] (spec 2.1).
+pub fn cell_at(s: UState, b: number, i: number) -> Cell {
+  let c = match in_range(b) && in_range(i) {
+    true => s.cells[b * 9 + i],
+    false => Empty,
+  }
+  return c
+}
+
+// The flat index convention: cells[b * 9 + i]. In G-CLOSED X holds (4,0) and
+// O holds (0,4); (8,8) was never played. FX-DRAWFREE's board 5 starts WX012.
+@example cells_probe() == "XO.X"
+fn cells_probe() -> string {
+  let a = xox.mark(cell_at(g_closed(), 4, 0))
+  let b = xox.mark(cell_at(g_closed(), 0, 4))
+  let c = xox.mark(cell_at(g_closed(), 8, 8))
+  let d = xox.mark(cell_at(fx_drawfree(), 5, 0))
+  return "${a}${b}${c}${d}"
+}
+
+// TE-003 [AC-2] every board is playable at the start
+@example nums_text(playable_boards(fx_new())) == "0,1,2,3,4,5,6,7,8"
+// TE-053 [AC-30] free move on a drawn target: 3 (drawn) and 5 (won) are out
+@example nums_text(playable_boards(after(fx_drawfree(), mv(0, 3)))) == "0,1,2,4,6,7,8"
+// TE-076 [ADV] a forced state offers exactly the forced board
+@example nums_text(playable_boards(g_20())) == "6"
+// TE-075 [ADV, G-3] a terminal state offers nothing
+@example nums_text(playable_boards(fx_tie43())) == ""
+@example nums_text(playable_boards(g_xwin())) == ""
+// What UI-5.1 / UI-5.2 highlight: the forced board alone, or every open board
+// on a free move, or nothing at all once the game is over (G-3).
+pub fn playable_boards(s: UState) -> Array<number> {
+  let open_boards = array.filter(array.range(9), fn(b: number) -> bool { is_open(s, b) })
+  // I-4 guarantees a forced board is open, so no re-derivation is needed here.
+  let allowed = match s.forced {
+    Some(b) => [b],
+    None => open_boards,
+  }
+  let none_playable: Array<number> = []
+  return match is_terminal(s) {
+    true => none_playable,
+    false => allowed,
+  }
+}
+
+// TE-032 [AC-19] 4 + 3 + 2 == 9 on a full grid
+@example tally_text(fx_tie43()) == "4,3,2"
+// TE-033 [AC-19] a drawn board counts for neither player
+@example tally_text(fx_alldrawn()) == "0,0,9"
+@example tally_text(fx_tieeq()) == "3,3,3"
+@example tally_text(fx_new()) == "0,0,0"
+// Mini-boards claimed by `who`. A drawn board is claimed by nobody (R-6), so
+// boards_won(X) + boards_won(O) + drawn == 9 on a full grid.
+pub fn boards_won(s: UState, who: Cell) -> number {
+  let mine = array.filter(
+    array.range(9),
+    fn(b: number) -> bool {
+      let claim = claim_of(s, b)
+      return !xox.is_empty(claim) && xox.same(claim, who)
+    },
+  )
+  return array.len(mine)
+}
+
+// TE-020 [AC-11] undo at the root is None
+@example undo_text(new_game(X)) == "none"
+// TE-019 [AC-11] every one of G-20's twenty plies undoes to its predecessor
+@example undo_chain_ok(g_20_text) == 20
+@example undo_chain_ok(g_chain5_text) == 5
+// TE-017 [ADV, AC-9] a rejected move must not corrupt history
+@example reject_then_undo_text() == "match"
+// Replays the history minus its last entry (spec 3.5). One implementation of
+// the rules, no inverse-move logic, so undo cannot drift from apply_move.
+pub fn undo(s: UState) -> Option<UState> {
+  let n = array.len(s.history)
+  let rebuilt = match n == 0 {
+    true => None,
+    false => undo_replay(first_player(s), array.slice(s.history, 0, n - 1)),
+  }
+  return rebuilt
+}
+
+fn undo_replay(first: Cell, prior: Array<Move>) -> Option<UState> {
+  return match replay(first, prior) {
+    Ok(p) => Some(p),
+    Err(_e) => None,
+  }
+}
+
+// TE-082 [ADV] replay and a fold of apply_move agree
+@example replay_probe(g_20_text) == "true"
+@example replay_probe(g_xwin_text) == "true"
+// TE-063 [ADV] replay validates by replaying, not by counting
+@example err_text(replay(X, moves_of(long_save()))) == "CellTaken(4,4)"
+// Validation by construction: every move goes through apply_move, and the
+// first rejection is the answer. This is what makes a tampered save unable to
+// produce an illegal state (D-U7).
+pub fn replay(first: Cell, moves: Array<Move>) -> Result<UState, MoveError> {
+  let start: Result<UState, MoveError> = Ok(new_game(first))
+  return array.fold(
+    moves,
+    start,
+    fn(acc: Result<UState, MoveError>, m: Move) -> Result<UState, MoveError> {
+      return match acc {
+        Ok(s) => apply_move(s, m),
+        Err(e) => Err(e),
+      }
+    },
+  )
+}
+
+// TE-064 [AC-47] encode/decode is a bijection on valid saves
+@example encode_of(g_20_text) == g_20_text
+@example encode_of(g_xwin_text) == g_xwin_text
+@example encode(new_game(X)) == "U1|X|"
+@example encode(new_game(O)) == "U1|O|"
+// "U1|<first player>|<two digits per move>" (spec 7.1): the move list, not the
+// grid - 2 bytes per move and trivially replayable.
+pub fn encode(s: UState) -> string {
+  let pairs = array.map(s.history, fn(m: Move) -> string { move_text(m) })
+  let digits = string.join(pairs, "")
+  return "U1|${xox.mark(first_player(s))}|${digits}"
+}
+
+// TE-021 [AC-12] decode(encode(s)) round-trips a 20-move game
+@example recode_text(g_20_text) == "true"
+// TE-054 [AC-47] bad prefix
+@example decode_text("U2|X|4444") == "err"
+// TE-055 [AC-47] missing or garbled framing
+@example decode_text("X|4444") == "err"
+@example decode_text("") == "err"
+@example decode_text("U1X4444") == "err"
+// TE-056 [AC-47] odd digit count
+@example decode_text("U1|X|444") == "err"
+// TE-057 [AC-47] non-digit characters
+@example decode_text("U1|X|44a4") == "err"
+@example decode_text("U1|X|4 4 ") == "err"
+// TE-058 [AC-47] pair 2 is WrongBoard
+@example decode_text("U1|X|4433") == "err"
+// TE-059 [AC-47] pair 2 is CellTaken
+@example decode_text("U1|X|4444") == "err"
+// TE-060 [AC-47] 9 is a digit but not a board
+@example decode_text("U1|X|99") == "err"
+// TE-061 [AC-47] the first-player token must be X or O
+@example decode_text("U1|Z|") == "err"
+// TE-062 [ADV] an empty move list is a valid save, equal to new_game(X)
+@example decode_text("U1|X|") == "ok:0"
+@example forced_text(decoded("U1|X|")) == "-"
+// TE-063 [ADV] 82 pairs: validation is by replay, so this dies at pair 2
+@example decode_text(long_save()) == "err"
+// TE-065 [ADV, G-4] surrounding whitespace is trimmed (documented: lenient)
+@example decode_text("U1|X|4440088226\n") == "ok:5"
+// TE-018 [AC-10] the decoded history is the move list, in order
+@example decode_text(g_20_text) == "ok:20"
+@example history_text(g_20()) == "01,12,23,34,45,56,67,78,80,02,24,46,68,81,13,35,57,70,03,36"
+// The inverse of `encode`. The framing is checked first, then the digits, then
+// the moves themselves - by replaying them, so any pair apply_move would
+// reject is an Err (AC-47). Surrounding whitespace is trimmed (G-4).
+pub fn decode(text: string) -> Result<UState, string> {
+  let t = string.trim(text)
+  let framed = string.slice(t, 0, 3) == "U1|" && string.slice(t, 4, 5) == "|"
+  let first = xox.cell_from(string.slice(t, 3, 4))
+  let digits = string.slice(t, 5)
+  let n = string.len(digits)
+  let values = array.map(
+    array.range(n),
+    fn(i: number) -> number { digit_of(string.slice(digits, i, i + 1)) },
+  )
+  let non_digits = array.filter(values, fn(v: number) -> bool { v < 0 })
+  let well_formed = framed && !xox.is_empty(first) && n % 2 == 0 && array.len(non_digits) == 0
+  return match well_formed {
+    true => decode_moves(first, values),
+    false => Err("malformed save"),
+  }
+}
+
+fn decode_moves(first: Cell, values: Array<number>) -> Result<UState, string> {
+  let moves = array.map(
+    array.range(array.len(values) / 2),
+    fn(k: number) -> Move { mv(values[k * 2], values[k * 2 + 1]) },
+  )
+  return match replay(first, moves) {
+    Ok(s) => Ok(s),
+    Err(e) => Err("illegal move in save: ${error_text(e)}"),
+  }
+}
+
+// TE-083 [ADV] render is a debug view: non-empty, and it touches nothing
+@example render_probe(g_xwin()) == "true true 89"
+@example render_probe(fx_new()) == "true true 89"
+// A debug/CLI view of the 9x9 grid, plus one status line. No DOM, no io: it
+// returns the text and lets the caller decide what to do with it.
+pub fn render(s: UState) -> string {
+  let rows = array.map(array.range(9), fn(r: number) -> string { render_row(s, r) })
+  let banded = array.map(
+    array.range(3),
+    fn(band: number) -> string {
+      let three = array.slice(rows, band * 3, band * 3 + 3)
+      return string.join(three, "\n")
+    },
+  )
+  let grid_text = string.join(banded, "\n ------+-------+------\n")
+  let where_text = match s.forced {
+    Some(b) => "board ${number.to_string(b)}",
+    None => "any open board",
+  }
+  return "${grid_text}\n ${xox.mark(s.turn)} to play in ${where_text}"
+}
+
+// One printed row spans three mini-boards: meta row `r / 3`, inner row `r % 3`.
+fn render_row(s: UState, r: number) -> string {
+  let meta_row = (r - r % 3) / 3
+  let inner_row = r % 3
+  let cells = array.map(
+    array.range(9),
+    fn(c: number) -> string {
+      let meta_col = (c - c % 3) / 3
+      let inner_col = c % 3
+      let b = meta_row * 3 + meta_col
+      let i = inner_row * 3 + inner_col
+      return xox.mark(s.cells[b * 9 + i])
+    },
+  )
+  let groups = array.map(
+    array.range(3),
+    fn(g: number) -> string {
+      let three = array.slice(cells, g * 3, g * 3 + 3)
+      return string.join(three, " ")
+    },
+  )
+  let joined = string.join(groups, " | ")
+  return " ${joined}"
+}
+
+// Derived from history parity (spec 3.5). Undefined for fixture states (G-2).
+@example xox.mark(first_player(g_20())) == "X"
+@example xox.mark(first_player(g_xwin())) == "X"
+@example xox.mark(first_player(new_game(O))) == "O"
+// Derivable from parity: after an even number of plies the side to move is the
+// one that started (spec 3.5).
+pub fn first_player(s: UState) -> Cell {
+  let even = array.len(s.history) % 2 == 0
+  return match even {
+    true => s.turn,
+    false => xox.other(s.turn),
+  }
+}
+
+// D-U5: the AI searches from a state with an empty history; nothing the rules
+// read may change (I-6).
+@example search_root_probe(g_20_text) == "0 true"
+@example search_root_probe(g_xwin_text) == "0 true"
+// D-U5: the same position with no history. Sound because of I-6 (no rules
+// function reads `history`), and it keeps the AI's clone cost independent of
+// how long the game has run.
+pub fn search_root(s: UState) -> UState {
+  let none_played: Array<Move> = []
+  let root: UState = {
+    cells: s.cells,
+    boards: s.boards,
+    forced: s.forced,
+    turn: s.turn,
+    history: none_played,
+  }
+  return root
+}
+
+// ---------------------------------------------------------------------------
+// Multi-step matrix cases that need a probe of their own
+// ---------------------------------------------------------------------------
+
+// TE-026 [AC-15] forced tracks the previous move's CELL at every ply
+@example forced_trace(g_chain5_text) == "4,0,8,2,6"
+// TE-047 [AC-28] and each ply's legal moves are exactly one board's empties
+@example chain_probe(g_chain5_text) == "4:8,0:9,8:9,2:9,6:9"
+// TE-028 [AC-17] free move on a DRAWN target
+@example forced_text(after(fx_drawfree(), mv(0, 3))) == "-"
+// TE-027 [AC-16] free move on a WON target
+@example forced_text(after(fx_wonfree(), mv(0, 3))) == "-"
+// TE-067 [ADV, AC-15] the move closes the board it was PLAYED in and points
+// at another, open board: forced is Some(2), not None
+@example forced_text(after(fx_winlast(), mv(0, 2))) == "2"
+// TE-049 [AC-29] self-pointing move, board still open -> forced Some(0)
+@example sp_probe(fx_sp_open()) == "open 0 6"
+// TE-050 [AC-29] self-pointing move that WINS the board -> forced None
+@example sp_probe(fx_sp_win()) == "X won [0,1,2] - 72"
+// TE-051 [AC-29] self-pointing move that FILLS the board -> forced None
+@example sp_probe(fx_sp_draw()) == "drawn - 72"
+fn sp_probe(s: UState) -> string {
+  let next = after(s, mv(0, 0))
+  let n = array.len(legal_moves(next))
+  return "${status_text(board_of(next, 0))} ${forced_text(next)} ${n}"
+}
+
+// TE-045 [AC-27] one move closes a mini-board AND completes the meta line
+@example term_text(after(state_at(g_xwin_text, 16), mv(8, 8))) == "X wins [0,4,8] true 0"
+// TE-066 [ADV] the terminal state still carries forced == Some(4): a
+// legal_moves that reads forced before is_terminal returns 9 moves here
+@example termforced_probe() == "4 0"
+fn termforced_probe() -> string {
+  let s = after(fx_termforced(), mv(2, 4))
+  return "${forced_text(s)} ${array.len(legal_moves(s))}"
+}
+
+// TE-018 [AC-10] history is every move, in order
+@example fill_probe(g_20()) == "20 20"
+// TE-022 / TE-023 [ADV, AC-13] apply_move returns a NEW record: neither the
+// input's cells nor its boards move, and history grows by exactly one
+@example apply_probe(g_20_text, 19) == "true 19 20 ooooooooo"
+// TE-078 [ADV, I-2] the boards cache is never stale, at any ply of G-XWIN
+@example boards_trace(g_xwin_text) == "ooooooooo,ooooooooo,ooooooooo,ooooooooo,ooooooooo,Xoooooooo,Xoooooooo,Xoooooooo,Xoooooooo,Xoooooooo,Xoooooooo,XoooXoooo,XoooXoooo,XoooXoooo,XoooXoooo,XoooXoooo,XoooXoooo,XoooXoooX"
+// TE-040 [AC-24, I-6] a replay-built state and a fixture-built one behave
+// identically: they differ only in history
+@example twin_probe(g_20_text) == "true true true true 7"
+// TE-040 [AC-24] two calls on structurally equal states built along
+// different paths (decode vs a fold of apply_move) return identical arrays,
+// and the array is board 6's seven empty cells
+@example repeat_probe(g_20_text) == "true 60,61,62,63,64,65,66"
+fn repeat_probe(text: string) -> string {
+  let a = moves_text(legal_moves(decoded(text)))
+  let b = moves_text(legal_moves(state_at(text, 20)))
+  return "${yn(a == b)} ${a}"
+}
+
+// TE-083 [ADV] the /-separated grid form is 89 characters and round-trips
+@example grid_round_trip(fx_tie43()) == "true 89"
+fn matrix_notes() -> string {
+  // TE-024 / TE-025 [AC-14] are static `grep` checks over this file and
+  // src/ai.glyph (imports restricted to std/{array,option,string,result,
+  // math,time} and xox; no document/window/self/postMessage). TE-081 needs a
+  // self-play harness (test-matrix 5.6) and lives with the js-tests.
+  return "see specs/test-matrix.md 3.1 (TE-024, TE-025) and 5.6 (TE-081)"
+}

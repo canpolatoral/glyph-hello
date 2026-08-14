@@ -1,0 +1,216 @@
+/* assets/ultimate.css — Ultimate-only styles (owner: UI-Ultimate).
+   Nothing here touches a Classic selector; it reuses xox.css's custom
+   properties (--x, --o, --chalk, --panel, --win, --rule, --grid, --mono). */
+
+.uboard{
+  --accent:var(--x);
+  --meta-gap:clamp(7px,1.8vw,13px);
+  --cell-gap:2px;
+  position:relative;
+  width:100%;
+}
+.uboard[data-turn="O"]{--accent:var(--o)}
+
+/* 81 cells at the 44px touch target need a 428px board, which no 360px phone
+   has. Cropping the board into a horizontal scroller was tried and rejected:
+   it hides a whole column of mini boards, and you cannot plan a move you
+   cannot see. So the board always fits the viewport, and the scroller only
+   engages below ~310px, where even a shrunken board would break. Cells are
+   >=44px from 430px of viewport up, ~38px at 360px. */
+.uboard-scroll{
+  overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:thin;
+  -webkit-overflow-scrolling:touch;
+  padding:4px;margin:-4px;
+}
+
+.umeta{
+  position:relative;
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:var(--meta-gap);
+  aspect-ratio:1;
+  padding:calc(var(--meta-gap) * .6);
+  border:1px solid var(--rule);
+  border-radius:6px;
+  background:var(--slate);
+  touch-action:manipulation;
+}
+
+/* The wobbly chalk rules that separate the nine boards — same hand as the
+   Classic board's grid lines. */
+.umeta-rules{
+  position:absolute;inset:0;width:100%;height:100%;pointer-events:none;
+  overflow:visible;
+}
+.umeta-rules path{
+  stroke:var(--grid);stroke-width:2.4;stroke-linecap:round;fill:none;opacity:.75;
+}
+
+/* ---------------------------------------------------------------- mini board */
+
+.umini{
+  position:relative;
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:var(--cell-gap);
+  aspect-ratio:1;
+  padding:3px;
+  border-radius:4px;
+  background:rgba(236,234,244,.022);
+  box-shadow:0 0 0 1px rgba(236,234,244,.05);
+  transition:opacity .2s ease,transform .22s cubic-bezier(.4,0,.2,1),
+    box-shadow .22s ease,background .22s ease,filter .2s ease;
+}
+
+/* 1. Everything that is not playable recedes and stops taking pointers. */
+/* Dimmed, not erased: you still have to be able to read the whole position
+   to plan, so the recede stops well short of invisible. */
+.umini.blocked{
+  opacity:.5;filter:saturate(.62);pointer-events:none;
+}
+
+.umini.playable{background:rgba(236,234,244,.05)}
+
+/* 2. + 3. The forced board is lifted, ringed in the mover's colour, and the
+   ring breathes — the only motion on the board at rest. */
+.umini.forced{
+  z-index:2;
+  transform:scale(1.035);
+  background:color-mix(in srgb,var(--accent) 9%,rgba(236,234,244,.05));
+  box-shadow:0 0 0 3px var(--accent),0 14px 34px rgba(0,0,0,.45);
+  animation:ubreathe 1.6s ease-in-out infinite;
+}
+@keyframes ubreathe{
+  0%,100%{box-shadow:0 0 0 3px var(--accent),0 0 0 0 color-mix(in srgb,var(--accent) 45%,transparent),0 14px 34px rgba(0,0,0,.45)}
+  50%    {box-shadow:0 0 0 3px var(--accent),0 0 0 9px color-mix(in srgb,var(--accent) 0%,transparent),0 14px 34px rgba(0,0,0,.45)}
+}
+
+/* 5. A free move is its own state: every open board gets a half-strength ring,
+   so "anywhere" never reads as "no rule is running". */
+.umini.free{
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 26%,transparent);
+  background:color-mix(in srgb,var(--accent) 3.5%,rgba(236,234,244,.05));
+}
+
+.umini.closed{background:rgba(236,234,244,.015)}
+.umini.won-x{background:color-mix(in srgb,var(--x) 9%,transparent)}
+.umini.won-o{background:color-mix(in srgb,var(--o) 9%,transparent)}
+.umini.drawn{
+  background:
+    repeating-linear-gradient(45deg,rgba(236,234,244,.05) 0 2px,transparent 2px 7px),
+    rgba(236,234,244,.015);
+}
+/* The claimed square keeps its cells legible under the overlay (UI-5.3). */
+.umini.closed .ucell{opacity:.6}
+.umini.forced .ucell.legal::after{opacity:.4}
+
+/* The meta square a won board claims, marked on the outer grid. */
+.umini-flag{
+  position:absolute;top:4px;left:6px;z-index:3;white-space:nowrap;
+  font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);opacity:.55;pointer-events:none;
+}
+.umini.forced .umini-flag{color:var(--accent);opacity:1;font-weight:600}
+
+/* -------------------------------------------------------------------- cells */
+
+.ucell{
+  position:relative;
+  display:grid;place-items:center;
+  aspect-ratio:1;min-width:0;min-height:0;padding:0;
+  background:transparent;border:0;border-radius:3px;
+  color:var(--accent);
+  cursor:pointer;
+  transition:background .15s ease,transform .15s ease;
+  -webkit-tap-highlight-color:transparent;
+}
+.ucell:disabled{cursor:default}
+.ucell.legal::after{
+  content:"";width:15%;aspect-ratio:1;border-radius:50%;
+  background:currentColor;opacity:.22;transition:opacity .15s ease,transform .15s ease;
+}
+.ucell.legal:hover{background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.ucell.legal:hover::after{opacity:.6;transform:scale(1.5)}
+.ucell:focus-visible{outline:2px solid var(--chalk);outline-offset:-2px;z-index:4}
+.ucell.last{box-shadow:inset 0 0 0 2px rgba(236,234,244,.42)}
+/* The three cells that actually won the mini board, tinted in the winner's
+   own colour so the claim and the line read as one thing. */
+.ucell.wincell{background:color-mix(in srgb,var(--win) 22%,transparent)}
+.umini.won-x .ucell.wincell{background:color-mix(in srgb,var(--x) 22%,transparent)}
+.umini.won-o .ucell.wincell{background:color-mix(in srgb,var(--o) 22%,transparent)}
+
+.umark{width:76%;height:76%;fill:none;stroke-linecap:round;stroke-width:5.5;overflow:visible}
+.umark.x{stroke:var(--x)}
+.umark.o{stroke:var(--o)}
+.umark path,.umark circle{stroke-dasharray:1;stroke-dashoffset:0}
+.umark.fresh{animation:upop .26s cubic-bezier(.34,1.4,.5,1) both}
+.umark.fresh path,.umark.fresh circle{animation:draw .3s cubic-bezier(.4,0,.2,1) both}
+.umark.fresh path:nth-child(2){animation-delay:.12s}
+@keyframes upop{from{transform:scale(.55)}to{transform:scale(1)}}
+
+/* ------------------------------------------------- won-board overlay (UI-5.3) */
+
+.umini-overlay{
+  position:absolute;inset:9%;pointer-events:none;z-index:2;
+  fill:none;stroke-linecap:round;stroke-width:3.4;overflow:visible;
+  opacity:.92;
+}
+.umini-overlay.x{stroke:var(--x);filter:drop-shadow(0 0 10px rgba(255,78,114,.45))}
+.umini-overlay.o{stroke:var(--o);filter:drop-shadow(0 0 10px rgba(47,212,200,.4))}
+.umini-overlay path,.umini-overlay circle{stroke-dasharray:1;stroke-dashoffset:0}
+.umini-overlay.fresh path,.umini-overlay.fresh circle{
+  animation:draw .5s cubic-bezier(.4,0,.2,1) both;
+}
+.umini-overlay.fresh circle,.umini-overlay.fresh path:nth-child(2){animation-delay:.12s}
+.umini-drawn-tag{
+  position:absolute;left:50%;bottom:5%;transform:translateX(-50%);z-index:3;
+  pointer-events:none;padding:2px 7px;border-radius:2px;
+  background:color-mix(in srgb,var(--ink-deep) 88%,transparent);
+  font-family:var(--mono);font-size:9px;letter-spacing:.18em;
+  text-transform:uppercase;color:var(--muted);
+}
+
+/* ------------------------------------------------- winning meta line (UI-5.7) */
+
+.ustreak{
+  position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:5;
+  overflow:visible;
+}
+.ustreak path{
+  stroke:var(--chalk);stroke-width:8;stroke-linecap:round;fill:none;opacity:.92;
+  stroke-dasharray:1;animation:draw .55s cubic-bezier(.4,0,.2,1) both;
+  filter:drop-shadow(0 0 12px rgba(236,234,244,.35));
+}
+
+/* ------------------------------------------------------------------ scrim */
+
+.uboard.over .umeta{filter:saturate(.75)}
+.uboard.thinking .umini.forced{animation-duration:.9s}
+
+@media (max-width:470px){
+  .umeta{min-width:300px;--meta-gap:6px;--cell-gap:1px;padding:3px}
+  .umini{padding:2px}
+  .umini.forced{transform:scale(1.02)}
+  .umini-flag{font-size:8px;top:2px;left:3px;letter-spacing:.04em}
+}
+@media (prefers-reduced-motion:reduce){
+  /* No pulse: the ring goes solid and thicker instead (architecture §5.2). */
+  .umini.forced{box-shadow:0 0 0 5px var(--accent),0 14px 34px rgba(0,0,0,.45)}
+  .umark path,.umark circle,.umini-overlay path,.umini-overlay circle,.ustreak path{
+    stroke-dashoffset:0;
+  }
+}
+
+/* Touch targets (UI-5.8). The rail controls have no reason to be under the
+   44px minimum at any width, so they are pinned once the layout stacks. The
+   board cells are the documented exception: at 360px nine mini boards cannot
+   each hold 44px cells without hiding a column behind a scroller, which the
+   forced-board rule makes unusable. Cells reach 44px from ~480px up. */
+@media (max-width: 820px) {
+  .seg button,
+  .ghost-btn,
+  .modeswitch button {
+    min-height: 44px;
+  }
+}

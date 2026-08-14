@@ -1,11 +1,13 @@
 module web
 
+import std/array
 import std/fs
 import std/http
 import std/io
 import std/option { Some, None }
 import std/path
 import std/process
+import std/string
 import xox { Board, Eval, Ongoing, Draw, Win }
 import xox
 
@@ -125,6 +127,10 @@ const js_type: string = "text/javascript; charset=utf-8"
 
 const text_type: string = "text/plain; charset=utf-8"
 
+const json_type: string = "application/json; charset=utf-8"
+
+const svg_type: string = "image/svg+xml"
+
 fn asset_path(name: string) -> string {
   return path.join([process.cwd(), asset_dir, name])
 }
@@ -141,6 +147,57 @@ fn serve_asset(name: string, mime: string) -> http.Response {
   }
 }
 
+// A missing static file is a 404, not the 500 that a missing index.html is:
+// one is a bad URL, the other is a broken install.
+fn read_static(rel: string, mime: string) -> http.Response {
+  return match fs.read_text(asset_path(rel)) {
+    Ok(text) => typed(200, text, mime),
+    Err(_e) => typed(404, "Not found: ${rel}", text_type),
+  }
+}
+
+fn extension_of(name: string) -> string {
+  let parts = string.split(name, ".")
+  let n = array.len(parts)
+  return match n > 1 {
+    true => parts[n - 1],
+    false => "",
+  }
+}
+
+// Text formats only: `fs.read_text` would corrupt a binary body, so an
+// extension that is not listed here is a 404 rather than a mangled file.
+fn mime_for(ext: string) -> Option<string> {
+  return match ext {
+    "html" => Some(html_type),
+    "css" => Some(css_type),
+    "js" => Some(js_type),
+    "mjs" => Some(js_type),
+    "json" => Some(json_type),
+    "map" => Some(json_type),
+    "svg" => Some(svg_type),
+    else => None,
+  }
+}
+
+// Everything under assets/ is servable, including the generated engine/ tree,
+// so the client can add a file without the server learning its name.
+fn static_route(route: string) -> http.Response {
+  let rel = string.slice(route, 1)
+  let escapes = string.contains(rel, "..")
+  return match escapes {
+    true => typed(403, "Refused: ${rel}", text_type),
+    false => by_extension(rel),
+  }
+}
+
+fn by_extension(rel: string) -> http.Response {
+  return match mime_for(extension_of(rel)) {
+    Some(mime) => read_static(rel, mime),
+    None => typed(404, "Not found: ${rel}", text_type),
+  }
+}
+
 fn missing(name: string, why: string) -> http.Response {
   io.eprintln("  Could not read ${asset_dir}/${name}: ${why}")
   return typed(500, "Missing ${asset_dir}/${name}", text_type)
@@ -149,10 +206,8 @@ fn missing(name: string, why: string) -> http.Response {
 fn handle(req: http.Request) -> Result<http.Response, string> {
   return match http.path(req) {
     "/" => Ok(serve_asset("index.html", html_type)),
-    "/xox.css" => Ok(serve_asset("xox.css", css_type)),
-    "/xox.js" => Ok(serve_asset("xox.js", js_type)),
     "/api/move" => Ok(move_route(req)),
-    else => Ok(http.text(404, "no such route")),
+    else => Ok(static_route(http.path(req))),
   }
 }
 

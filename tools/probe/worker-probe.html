@@ -1,0 +1,178 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>worker probe</title>
+<!--
+  A headless-Chrome harness for assets/worker.js. It is NOT part of the app —
+  index.html belongs to the Shell owner and this agent does not touch it — so
+  it lives in tools/probe/ and is served from the same origin by
+  `node tools/serve-static.mjs --probe`.
+
+  It creates the real module worker, drives the real protocol, and prints every
+  result into the DOM so `--dump-dom` captures it.
+
+      node tools/serve-static.mjs --port 8080 --probe --quiet &
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        --headless=new --disable-gpu --dump-dom --virtual-time-budget=20000 \
+        http://127.0.0.1:8080/worker-probe.html
+-->
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById("out");
+const lines = [];
+const log = (s) => { lines.push(s); out.textContent = lines.join("\n"); };
+
+let failures = 0;
+function check(name, ok, detail) {
+  if (!ok) failures++;
+  log(`${ok ? "PASS" : "FAIL"}  ${name}${detail === undefined ? "" : `  ${detail}`}`);
+}
+
+// ---- a minimal promise client over the protocol (engine-client.js has no
+// ---- owner this phase; this is a probe, not that deliverable).
+const worker = new Worker("/worker.js", { type: "module" });
+const pending = new Map();
+let nextId = 1;
+let ready = null;
+const readyPromise = new Promise((r) => { ready = r; });
+
+worker.addEventListener("message", (e) => {
+  const m = e.data;
+  if (m.id === 0 && m.type === "ready") { ready(m); return; }
+  const slot = pending.get(m.id);
+  if (slot) { pending.delete(m.id); slot(m); }
+  else log(`(unmatched response) ${JSON.stringify(m)}`);
+});
+worker.addEventListener("error", (e) => {
+  failures++;
+  log(`FAIL  worker error: ${e.message}`);
+  finish();
+});
+
+function send(req) {
+  const id = nextId++;
+  const p = new Promise((resolve) => pending.set(id, resolve));
+  worker.postMessage({ ...req, id });
+  return { id, done: p };
+}
+const ask = (req) => send(req).done;
+
+const OPENING = "U1|X|";
+const TERMINAL =
+  "U1|X|788552288887733558866556600441177667755000077110055111155440011883311445533444488002266116666882222112200663300884433337700347";
+
+try {
+  // 1 -- the unsolicited ready message
+  const r = await readyPromise;
+  check("ready arrives with the reserved id 0", r.id === 0 && r.type === "ready", `buildAt=${r.buildAt}`);
+
+  // 2 -- ping / id echo
+  const pong = await ask({ type: "ping" });
+  check("ping echoes its id (AC-44)", pong.type === "pong" && pong.id === nextId - 1, JSON.stringify(pong));
+
+  // 3 -- legalMoves on the opening position
+  const lm = await ask({ type: "legalMoves", state: OPENING });
+  check("legalMoves on the opening position = 81", lm.type === "result" && lm.value.length === 81,
+    `${lm.value?.length} moves, first ${JSON.stringify(lm.value?.[0])}`);
+  const legalSet = new Set((lm.value ?? []).map((m) => `${m.board}${m.cell}`));
+
+  // 4 -- THE HEADLINE: a Hard search off the main thread returns a LEGAL move.
+  //      While it runs, count animation frames on the main thread (FR-4.4).
+  let frames = 0;
+  let worstGapMs = 0;
+  let lastFrame = performance.now();
+  let counting = true;
+  const tick = (t) => {
+    if (!counting) return;
+    frames++;
+    worstGapMs = Math.max(worstGapMs, t - lastFrame);
+    lastFrame = t;
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+
+  const t0 = performance.now();
+  const chosen = await ask({
+    type: "choose", mode: "ultimate", state: OPENING,
+    level: "hard", seed: 918273, budgetMs: 1500,
+  });
+  const wall = Math.round(performance.now() - t0);
+  counting = false;
+
+  check("hard choose answers `chosen`", chosen.type === "chosen", JSON.stringify(chosen));
+  const mv = chosen.move ?? {};
+  check("the chosen move is legal in the opening position",
+    legalSet.has(`${mv.board}${mv.cell}`), `board ${mv.board} cell ${mv.cell}`);
+  check("it searched at least depth 3 (AC-36)", chosen.depth >= 3,
+    `depth ${chosen.depth}, ${chosen.nodes} nodes, worker elapsedMs ${chosen.elapsedMs}, main-thread wall ${wall} ms`);
+  check("it stayed inside the 1500 ms budget (FR-4.5)", chosen.elapsedMs <= 1500, `${chosen.elapsedMs} ms`);
+  check("the response carries the post-move save", typeof chosen.state === "string" && chosen.state.length === 7,
+    JSON.stringify(chosen.state));
+  log(`      main thread during the search: ${frames} animation frame(s), worst gap ${Math.round(worstGapMs)} ms`);
+
+  // 5 -- the returned save really is the opening move applied
+  const back = await ask({ type: "legalMoves", state: chosen.state });
+  check("the returned save decodes and is a real position",
+    back.type === "result" && back.value.length > 0, `${back.value?.length} legal replies`);
+
+  // 6 -- AC-43: an illegal move is a normal response, not a throw
+  const bad = await ask({ type: "applyMove", state: "U1|X|44", move: { board: 0, cell: 0 } });
+  check("wrong board -> rejected with the MoveError tag (AC-43)",
+    bad.type === "rejected" && bad.error.code === "WrongBoard", JSON.stringify(bad.error));
+
+  // 7 -- AC-44: unknown type -> error, and the worker is still alive after it
+  const oops = await ask({ type: "frobnicate" });
+  check("unknown type -> error (AC-44)", oops.type === "error" && oops.code === "BadRequest", JSON.stringify(oops));
+  const alive = await ask({ type: "legalMoves", state: OPENING });
+  check("the worker survived it", alive.type === "result" && alive.value.length === 81);
+
+  // 8 -- a finished game
+  const over = await ask({
+    type: "choose", mode: "ultimate", state: TERMINAL,
+    level: "hard", seed: 1, budgetMs: 200,
+  });
+  check("choose on a finished game -> rejected GameOver",
+    over.type === "rejected" && over.error.code === "GameOver", JSON.stringify(over));
+
+  // 9 -- classic through the same pipe (§3.5)
+  const cls = await ask({
+    type: "choose", mode: "classic", state: "XX.......",
+    turn: "O", level: "hard", seed: 1, budgetMs: 1500,
+  });
+  check("classic choose blocks the open two-in-a-row",
+    cls.type === "chosen" && cls.move.square === 2, JSON.stringify(cls));
+
+  // 10 -- D-W1: a cancel lands mid-search, and the cancelled job never
+  //       answers `chosen`
+  const job = send({ type: "choose", mode: "ultimate", state: OPENING, level: "hard", seed: 1, budgetMs: 8000 });
+  await new Promise((res) => setTimeout(res, 50));
+  const ack = await ask({ type: "cancel", target: job.id });
+  const jobEnd = await job.done;
+  check("the cancel is acknowledged", ack.type === "cancelled" && ack.target === job.id, JSON.stringify(ack));
+  check("the cancelled job answers `cancelled`, never `chosen` (D-W1)",
+    jobEnd.type === "cancelled" && jobEnd.id === job.id, JSON.stringify(jobEnd));
+
+  // 11 -- and it is still usable afterwards
+  const after = await ask({ type: "choose", mode: "ultimate", state: OPENING, level: "medium", seed: 4, budgetMs: 500 });
+  check("still answers after a cancel", after.type === "chosen", JSON.stringify(after.move));
+} catch (err) {
+  failures++;
+  log(`FAIL  threw: ${err && err.stack ? err.stack : err}`);
+}
+
+finish();
+
+function finish() {
+  log("");
+  log(failures === 0 ? "PROBE-COMPLETE OK" : `PROBE-COMPLETE ${failures} FAILURE(S)`);
+  document.title = failures === 0 ? "probe ok" : `probe ${failures} failed`;
+  // Releases the /__hold.js request below, which is what lets the load event
+  // fire and `--dump-dom` capture a finished page. See tools/serve-static.mjs.
+  fetch("/__done", { method: "POST", body: lines.join("\n") }).catch(() => {});
+}
+</script>
+<!-- Deferred, and last in document order: the load event (and therefore
+     --dump-dom) waits for this request, which tools/serve-static.mjs holds
+     open until the probe POSTs /__done. -->
+<script defer src="/__hold.js"></script>
+</body>

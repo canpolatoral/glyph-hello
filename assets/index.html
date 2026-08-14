@@ -3,49 +3,58 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>XOX</title>
+<title>XOX — Ultimate</title>
 <link rel="stylesheet" href="/xox.css">
+<link rel="stylesheet" href="/ultimate.css">
 </head>
 <body>
 <div class="grain" aria-hidden="true"></div>
+
 <main class="stage">
   <header class="masthead">
     <h1 class="wordmark"><span>X</span><span>O</span><span>X</span></h1>
-    <p class="tag">Nine squares, searched to the last ply</p>
+    <p class="tag" id="tagline">Nine boards inside nine boards</p>
+    <div class="seg modeswitch" id="modeSwitch" role="tablist" aria-label="Game mode">
+      <button type="button" role="tab" data-mode="classic" aria-selected="false">Classic <em>3&times;3</em></button>
+      <button type="button" role="tab" data-mode="ultimate" aria-selected="true">Ultimate <em>9&times;9</em></button>
+    </div>
   </header>
 
   <div class="play">
-    <svg id="board" class="board" viewBox="0 0 320 320" aria-label="Board"></svg>
-    <p class="caption" id="caption"></p>
+    <div id="classicBoard" class="boardhost" hidden>
+      <svg id="board" class="board" viewBox="0 0 320 320" aria-label="Classic board"></svg>
+    </div>
+    <div id="ultimateBoard" class="boardhost"></div>
+    <p class="caption" id="caption" aria-live="polite"></p>
   </div>
 
   <aside class="rail">
-    <div class="status" id="status">
+    <div class="status" id="status" role="status" aria-live="polite">
       <span class="status-word" id="statusWord">Your move</span>
       <span class="status-note" id="statusNote">You are X</span>
     </div>
 
     <section class="field">
       <h2 class="label">Opponent</h2>
-      <div class="seg" id="levelSeg">
-        <button data-level="perfect" class="on">Perfect</button>
-        <button data-level="fair">Fair</button>
-        <button data-level="careless">Careless</button>
-        <button data-level="human">2 players</button>
+      <div class="seg" id="difficulty">
+        <button type="button" data-level="easy">Easy</button>
+        <button type="button" data-level="medium">Medium</button>
+        <button type="button" data-level="hard">Hard</button>
+        <button type="button" data-level="human">2 players</button>
       </div>
     </section>
 
     <section class="field" id="sideField">
       <h2 class="label">You play</h2>
-      <div class="seg" id="sideSeg">
-        <button data-side="X" class="on">X <em>first</em></button>
-        <button data-side="O">O <em>second</em></button>
+      <div class="seg" id="side">
+        <button type="button" data-side="X">X <em>first</em></button>
+        <button type="button" data-side="O">O <em>second</em></button>
       </div>
     </section>
 
     <section class="field">
-      <h2 class="label">Tally</h2>
-      <div class="tally">
+      <h2 class="label">Tally <span class="label-note" id="tallyScope">ultimate · medium</span></h2>
+      <div class="tally" id="tally">
         <div><b id="tallyYou">0</b><span id="labelYou">you</span></div>
         <div><b id="tallyCpu">0</b><span id="labelCpu">engine</span></div>
         <div><b id="tallyDraw">0</b><span>draws</span></div>
@@ -53,13 +62,46 @@
     </section>
 
     <div class="actions">
-      <button id="xray" class="ghost-btn" aria-pressed="false">X-ray <kbd>X</kbd></button>
-      <button id="reset" class="ghost-btn">New game <kbd>R</kbd></button>
+      <div class="actions-row">
+        <button id="undo" class="ghost-btn" type="button">Undo <kbd>U</kbd></button>
+        <button id="redo" class="ghost-btn" type="button">Redo <kbd>Y</kbd></button>
+      </div>
+      <button id="newGame" class="ghost-btn" type="button">New game <kbd>R</kbd></button>
+      <button id="rules" class="ghost-btn" type="button">Rules <kbd>?</kbd></button>
+      <div class="actions-row">
+        <button id="sound" class="ghost-btn" type="button" aria-pressed="false">Sound <kbd>M</kbd></button>
+        <button id="xray" class="ghost-btn" type="button" aria-pressed="false">X-ray <kbd>X</kbd></button>
+      </div>
+      <button id="resetAll" class="ghost-btn quiet" type="button">Reset all data</button>
     </div>
 
-    <p class="credit">minimax engine in Glyph<br>served by std/http</p>
+    <p class="credit" id="credit">engine &amp; search in Glyph<br>thinking in a web worker</p>
   </aside>
 </main>
-<script src="/xox.js"></script>
+
+<dialog id="rulesPanel" class="rules" aria-labelledby="rulesTitle">
+  <form method="dialog" class="rules-close"><button value="close" aria-label="Close rules">&times;</button></form>
+  <h2 id="rulesTitle">Ultimate tic tac toe</h2>
+  <ol class="rules-list">
+    <li><b>Nine boards, one grid.</b> Every square of the big grid holds a whole
+      tic tac toe board of its own.</li>
+    <li><b>Your move sends me somewhere.</b> Play the top-right square of any
+      mini board and I must answer in the <em>top-right mini board</em>. The
+      board you are sent to is outlined and everything else dims.</li>
+    <li><b>Closed board? Free move.</b> If the board you are sent to is already
+      won or full, you may play in any open board.</li>
+    <li><b>Win a mini board, claim its square.</b> Three claimed squares in a
+      row on the big grid wins the game.</li>
+    <li><b>Drawn mini boards belong to nobody</b> — they are closed, but neither
+      player can claim them.</li>
+    <li><b>Full grid, no line?</b> Whoever won more mini boards takes it; equal
+      counts is a draw.</li>
+  </ol>
+  <p class="rules-keys"><b>Keyboard</b> — arrows move inside a mini board,
+    shift + arrows jump a whole board, enter plays. <kbd>U</kbd> undo,
+    <kbd>Y</kbd> redo, <kbd>R</kbd> new game, <kbd>M</kbd> sound.</p>
+</dialog>
+
+<script type="module" src="/app.js"></script>
 </body>
 </html>
