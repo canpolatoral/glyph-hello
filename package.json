@@ -3,8 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "prestart": "node -e \"fs.existsSync('assets/engine')||child_process.execFileSync(process.execPath,['tools/build-web.mjs'],{stdio:'inherit'})\"",
     "start": "glyph run",
-    "build": "glyph build src --out dist"
+    "build": "glyph build src --out dist",
+    "build:web": "node tools/build-web.mjs"
   },
   "glyph": {
     "src": "src"
